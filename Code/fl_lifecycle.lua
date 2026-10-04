@@ -28,7 +28,8 @@ local BOOLEAN_KEYS = { "ENABLE_MOD", "ENABLE_TEST_UI", "DEBUG_LOGS", "DEBUG_HYDR
     "ICE_PLANET_COLD" }
 
 local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "REBUILD_SLICE_MS", "REBUILD_SLICE_SLEEP_MS", "PAUSED_TICK_MS", "TICK_MS",
-    "TERRAIN_RESCAN_HOURS", "TEST_RAIN_MULTIPLIER", "WET_SNAPSHOT_TICKS", "EFFECT_INTERVAL_HOURS",
+    "BACKGROUND_SLICE_MS", "TERRAIN_CHECK_ROWS_PER_TICK", "TERRAIN_BOX_CELLS_PER_TICK", "TERRAIN_SETTLE_MS", "TERRAIN_YIELD_MS",
+    "TEST_RAIN_MULTIPLIER", "WET_SNAPSHOT_TICKS", "EFFECT_INTERVAL_HOURS",
     "EVAPORATION_BARREN_MULTIPLIER", "FLOOD_SUSPEND_DEPTH_MM", "FLOOD_RESUME_DEPTH_MM",
     "RECHARGE_RADIUS_M", "RECHARGE_LITRES_PER_UNIT", "RESIDUE_FULL_EFFECT_MM", "RESIDUE_MAX_RADIUS_M",
     "RAIN_REFERENCE_MM_H", "ROVER_SLOW_DEPTH_MM", "ROVER_FORD_DEPTH_MM", "DRONE_SHORT_DEPTH_MM",
@@ -41,7 +42,7 @@ local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "R
 function L.Validate()
     for _, name in ipairs({ "PlaceObject", "DoneObject", "ApplyAllWaterObjects", "AddRects",
         "IsValid", "IsValidThread", "CreateGameTimeThread", "DeleteThread", "GameTime", "Sleep",
-        "CreateRealTimeThread", "IsPaused", "IsChangingMap",
+        "CreateRealTimeThread", "IsPaused", "IsChangingMap", "RealTime", "IsBox",
         "GetPreciseTicks",
         "RainProcedure", "StopRainsDisaster", "IsDisasterActive", "GetHUD", "HasGameLogic" }) do
         if type(rawget(_G, name)) ~= "function" then return false, name .. " API unavailable" end
@@ -163,35 +164,36 @@ local function update_effects()
     each_effect("Hourly", elapsed * 1.0 / const.HourDuration, s.last_nominal_rate or 0, s.last_toxic == true)
 end
 
--- One slice of a terrain rebuild job. Returns true while the job owns the tick.
+-- Starts the first build when there is no model, then runs one slice of the
+-- terrain job if one is running. Returns true when a job slice ran.
 local function rebuild_slice()
     local s = F.State
+    if not s.rebuild_job and not s.model then F.Terrain.StartRebuild(s.map) end
     if not s.rebuild_job then return false end
-    local previous = s.model
-    if F.Terrain.StepRebuild() then
-        if s.model ~= previous then s.wet, s.wet_concentration = false, false end
-        s.next_scan = GameTime() + F.Config.TERRAIN_RESCAN_HOURS * const.HourDuration
-        if not s.last_tick then
-            s.last_tick = GameTime()
-            s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
-        end
+    if F.Terrain.StepRebuild() and not s.last_tick then
+        s.last_tick = GameTime()
+        s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
     end
-    F.UI.Refresh()
     return true
 end
 
+-- The simulation thread wakes every TICK_MS, or every REBUILD_SLICE_SLEEP_MS
+-- while a terrain job runs. Each wake runs one job slice; the full tick (rain,
+-- water step, terrain tracking, effects, drawing) runs once per TICK_MS. A
+-- background rebuild therefore never pauses the simulation.
 function L.Tick()
     local s = F.State
     if F.Config.ENABLE_MOD ~= true then L.Disable(); return end
     if s.saving then return end
+    local sliced = rebuild_slice()
+    if not s.model then F.UI.Refresh(); return end -- first build still running
+    local now = GameTime()
+    if sliced and s.last_full_tick and now - s.last_full_tick < F.Config.TICK_MS then return end
+    s.last_full_tick = now
     F.Rain.Sync()
     L.Advance()
-    if not s.rebuild_job and (s.dirty or not s.model or GameTime() >= (s.next_scan or 0)) then
-        F.Terrain.StartRebuild(s.map)
-    end
-    -- A rebuild owns whole ticks: one slice per tick, and the tick that finishes
-    -- it does nothing else. Water and effects wait meanwhile.
-    if rebuild_slice() then return end
+    F.Terrain.Track()
+    if F.Terrain.WantsRebuild() then F.Terrain.StartRebuild(s.map) end
     update_effects()
     s.status = s.last_rate > 0 and "Rain feeding catchments" or "Dry weather: evaporation and infiltration"
     F.UI.Refresh()
@@ -212,10 +214,13 @@ function L.PausedTick()
     -- New maps are generated and switched while paused; scan only a settled map
     -- (the same readiness test as vanilla AgentPlayTest.lua:181).
     if not GameState.gameplay or IsChangingMap() or rawget(_G, "GeneratingMap") then return end
-    if not s.rebuild_job and (s.dirty or not s.model) then F.Terrain.StartRebuild(s.map) end
-    if rebuild_slice() then return end
-    if not s.model then return end
-    draw(false)
+    rebuild_slice()
+    if s.model then
+        -- Construction can be placed while paused: keep the terrain current too.
+        F.Terrain.Track()
+        if F.Terrain.WantsRebuild() then F.Terrain.StartRebuild(s.map) end
+        draw(false)
+    end
     F.UI.Refresh()
 end
 
@@ -242,7 +247,8 @@ function L.Enable()
     local valid, err = L.Validate()
     if not valid then F.SetError("Validation", err); return false end
     if s.map ~= MainMap then
-        s.model, s.grid, s.last_tick, s.next_scan = false, false, nil, nil
+        F.Terrain.Reset()
+        s.model, s.grid, s.last_tick, s.last_full_tick = false, false, nil, nil
         s.wet, s.wet_concentration, s.last_effects, s.recharge = false, false, false, {}
         s.map, s.dirty = MainMap, true
         F.Ice.StopTestFrost()
@@ -305,8 +311,8 @@ function L.MapDone(map)
     s.enabled, s.thread, s.map, s.model, s.grid = false, false, false, false, false
     s.paused_thread = false -- its loop ends once the map is gone
     s.markers, s.retiring, s.rain_thread, s.rain_strength = {}, {}, false, 0
-    s.last_tick, s.next_scan, s.saving = nil, nil, false
-    F.Terrain.CancelRebuild()
+    s.last_tick, s.last_full_tick, s.saving = nil, nil, false
+    F.Terrain.Reset()
     s.wet, s.wet_concentration, s.last_effects, s.recharge = false, false, false, {}
     s.flooded_buildings, s.slowed_rovers = 0, 0
     -- Label modifiers lived on the map's city and are gone with it.

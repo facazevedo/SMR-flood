@@ -21,6 +21,43 @@ local function neighbours(i, w, h, visit)
     if i <= w * (h - 1) then visit(i + w) end
 end
 
+-- Sorts list in place with less(a, b), calling yield_fn (when given) every few
+-- thousand steps: table.sort cannot pause, and sorting a 6 km map's 147,456 cells
+-- in one go stalls the game for most of a second. Bottom-up merge sort; with a
+-- strict total order the result equals table.sort's.
+local function sort_yielding(list, less, yield_fn)
+    local n = #list
+    if not yield_fn then table.sort(list, less); return end
+    local src, dst = list, {}
+    local width, steps = 1, 0
+    while width < n do
+        for lo = 1, n, 2 * width do
+            local mid, hi = math.min(lo + width, n + 1), math.min(lo + 2 * width, n + 1)
+            local i, j, k = lo, mid, lo
+            -- Yield inside the merge: the last passes merge up to the whole list
+            -- in one block.
+            while i < mid and j < hi do
+                if less(src[j], src[i]) then dst[k] = src[j]; j = j + 1 else dst[k] = src[i]; i = i + 1 end
+                k = k + 1
+                steps = steps + 1
+                if steps >= 256 then steps = 0; yield_fn() end
+            end
+            while i < mid do dst[k] = src[i]; i = i + 1; k = k + 1 end
+            while j < hi do dst[k] = src[j]; j = j + 1; k = k + 1 end
+            steps = steps + 1
+            if steps >= 256 then steps = 0; yield_fn() end
+        end
+        src, dst = dst, src
+        width = width * 2
+    end
+    if src ~= list then
+        for i = 1, n do
+            list[i] = src[i]
+            if i % 4096 == 0 then yield_fn() end
+        end
+    end
+end
+
 function H.Build(width, height, elevations, cell_area, yield_fn)
     assert(width >= 3 and height >= 3 and #elevations == width * height, "invalid terrain grid")
     assert(cell_area > 0, "invalid cell area")
@@ -29,10 +66,13 @@ function H.Build(width, height, elevations, cell_area, yield_fn)
         budget = { rain = 0, evaporation = 0, infiltration = 0, outflow = 0, ground = 0 } }
     local nodes, sinks = model.nodes, model.sinks
     local order, uf, component = {}, { [0] = 0 }, { [0] = 0 }
-    for i = 1, #elevations do order[i] = i end
-    table.sort(order, function(a, b)
+    for i = 1, #elevations do
+        order[i] = i
+        if yield_fn and i % 4096 == 0 then yield_fn() end
+    end
+    sort_yielding(order, function(a, b)
         return elevations[a] < elevations[b] or (elevations[a] == elevations[b] and a < b)
-    end)
+    end, yield_fn)
     local function root(i)
         local r = i
         while uf[r] ~= r do r = uf[r] end
@@ -111,7 +151,7 @@ function H.Build(width, height, elevations, cell_area, yield_fn)
         end
         if sinks[i] == 0 then model.outlet_cells = model.outlet_cells + 1
         else nodes[sinks[i]].catchment = nodes[sinks[i]].catchment + 1 end
-        if yield_fn and k % 8192 == 0 then yield_fn() end
+        if yield_fn and k % 256 == 0 then yield_fn() end
     end
     -- Cells whose runoff sink is each node: lets wet-cell queries visit only the
     -- cells under wet basins instead of the whole grid.
@@ -122,6 +162,7 @@ function H.Build(width, height, elevations, cell_area, yield_fn)
             if not list then list = {}; cells_of[sink] = list end
             list[#list + 1] = i
         end
+        if yield_fn and i % 1024 == 0 then yield_fn() end
     end
     model.cells_of = cells_of
     return model
@@ -164,11 +205,20 @@ end
 -- walk below therefore uses an explicit stack, visiting nodes and summing in the
 -- same order as the equivalent recursion.
 
+-- yield_fn, when given (restores in a terrain job), is called every 256 nodes:
+-- a large lake's subtree has thousands of them.
+local YIELD_NODES = 256
+
 -- Split a subtree's tracer among its nodes in proportion to their water.
-local function distribute_mass(model, n, mass)
+local function distribute_mass(model, n, mass, yield_fn)
     local nodes = model.nodes
     local stack_n, stack_m = { n }, { mass }
+    local visited = 0
     while #stack_n > 0 do
+        if yield_fn then
+            visited = visited + 1
+            if visited % YIELD_NODES == 0 then yield_fn() end
+        end
         local node, m = stack_n[#stack_n], stack_m[#stack_m]
         stack_n[#stack_n], stack_m[#stack_m] = nil, nil
         local children = node.children
@@ -190,10 +240,15 @@ end
 
 -- Store water in a subtree without overflowing it. Return unconsumed input.
 -- Children fill first, in order, while input remains; then the node itself.
-local function fill(model, n, water, mass)
+local function fill(model, n, water, mass, yield_fn)
     local nodes = model.nodes
     local stack = { { n, 1 } }
+    local visited = 0
     while #stack > 0 do
+        if yield_fn then
+            visited = visited + 1
+            if visited % YIELD_NODES == 0 then yield_fn() end
+        end
         local frame = stack[#stack]
         local node, k = frame[1], frame[2]
         local children = node.children
@@ -226,15 +281,15 @@ end
 function H.Balance(model, yield_fn)
     local outflow, tracer_out = 0, 0
     for k, n in ipairs(model.nodes) do
-        if yield_fn and k % 512 == 0 then yield_fn() end
+        if yield_fn and k % 64 == 0 then yield_fn() end
         for _, id in ipairs(n.children) do
             local child = model.nodes[id]
             if n.water > 0 and child.total < child.capacity then
-                n.water, n.mass = fill(model, child, n.water, n.mass)
+                n.water, n.mass = fill(model, child, n.water, n.mass, yield_fn)
             end
         end
         totals(model, n)
-        if n.water > 0 then distribute_mass(model, n, n.total_mass) end
+        if n.water > 0 then distribute_mass(model, n, n.total_mass, yield_fn) end
         local excess = max(0, n.water - n.extra_capacity)
         if excess > 0 then
             local tracer = n.mass * div(excess, n.water)
@@ -379,10 +434,15 @@ function H.Total(model)
     return water, mass
 end
 
-function H.Pools(model)
+function H.Pools(model, yield_fn)
     local pools, stack = {}, {}
     for _, id in ipairs(model.roots) do stack[#stack + 1] = id end
+    local visited = 0
     while #stack > 0 do
+        if yield_fn then
+            visited = visited + 1
+            if visited % YIELD_NODES == 0 then yield_fn() end
+        end
         local n = model.nodes[remove(stack)]
         if n.water > 0 then
             pools[#pools + 1] = { node = n.id, seed = n.seed, level = H.Level(model, n),
@@ -401,14 +461,20 @@ end
 -- Ancestors of a node outside every pool subtree cannot be pool members, so only
 -- the cells under wet subtrees are visited (not the whole grid).
 local no_cells = {}
-function H.WetCells(model)
+-- yield_fn, when given (the handover of a terrain job), is called every 256 nodes.
+function H.WetCells(model, yield_fn)
     local wet, concentration, pool_cells = {}, {}, {}
-    local pools = H.Pools(model)
+    local pools = H.Pools(model, yield_fn)
     local nodes, cells_of, elevations = model.nodes, model.cells_of, model.elevations
+    local visited = 0
     for _, pool in ipairs(pools) do
         local level, c, count = pool.level, pool.concentration, 0
         local stack = { pool.node }
         while #stack > 0 do
+            if yield_fn then
+                visited = visited + 1
+                if visited % YIELD_NODES == 0 then yield_fn() end
+            end
             local n = nodes[remove(stack)]
             for _, i in ipairs(cells_of[n.id] or no_cells) do
                 local z = elevations[i]
@@ -434,31 +500,41 @@ end
 
 -- Plain numeric records keyed by cell preserve volume and residue across
 -- saves and terrain rebuilds. No engine objects, UI or threads are serialized.
-function H.Export(model)
-    local records, wet = {}, H.WetCells(model)
+function H.Export(model, yield_fn)
+    local records, wet = {}, H.WetCells(model, yield_fn)
     local concentration = {}
-    for _, pool in ipairs(H.Pools(model)) do
+    local visited = 0
+    for _, pool in ipairs(H.Pools(model, yield_fn)) do
         local stack = { pool.node }
         while #stack > 0 do
+            if yield_fn then
+                visited = visited + 1
+                if visited % YIELD_NODES == 0 then yield_fn() end
+            end
             local n = model.nodes[remove(stack)]
             concentration[n.id] = div(pool.mass, pool.volume)
             for _, id in ipairs(n.children) do stack[#stack + 1] = id end
         end
     end
+    local k = 0
     for i, depth in pairs(wet) do
+        k = k + 1
+        if yield_fn and k % 512 == 0 then yield_fn() end
         local id = model.sinks[i]
         while id ~= 0 and concentration[id] == nil do id = model.nodes[id].parent end
         local volume = depth * model.area
         records[#records + 1] = { i, volume, volume * (concentration[id] or 0) }
     end
-    for _, n in ipairs(model.nodes) do
+    for j, n in ipairs(model.nodes) do
+        if yield_fn and j % 1024 == 0 then yield_fn() end
         if n.water == 0 and n.mass > 0 then records[#records + 1] = { n.seed, 0, n.mass } end
     end
     return records
 end
 
 function H.Import(model, records, yield_fn)
-    for _, rec in ipairs(records) do
+    for k, rec in ipairs(records) do
+        if yield_fn and k % 1024 == 0 then yield_fn() end
         local sink = model.sinks[rec[1]]
         assert(sink ~= nil and rec[2] >= 0 and rec[3] >= 0, "invalid saved water cell")
         if sink == 0 then model.budget.outflow = model.budget.outflow + rec[2]

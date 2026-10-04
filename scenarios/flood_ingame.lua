@@ -21,6 +21,8 @@ local function wait_real(ms) Sleep(ms) end
 local function smr_ui()
     local ui = rawget(_G, "SMR_UI")
     if ui == nil then
+        -- The harness keeps SMR_UI behind the global metatable. Before its UI
+        -- helper is loaded, this lookup logs a harmless strict-mode error.
         local mt = getmetatable(_G)
         ui = mt and mt.__index and mt.__index(_G, "SMR_UI") or nil
     end
@@ -485,30 +487,32 @@ HARNESS.scenario("flood_40_ground_and_people", function(ctx)
     local rates = { cfg.FRESH_SOIL_PCT_PER_HOUR, cfg.TOXIC_SOIL_PCT_PER_HOUR, cfg.RESIDUE_SOIL_PCT_PER_HOUR }
     cfg.FRESH_SOIL_PCT_PER_HOUR, cfg.TOXIC_SOIL_PCT_PER_HOUR, cfg.RESIDUE_SOIL_PCT_PER_HOUR = 5, 5, 5
     local soil_start = GetSoilQuality(q, r)
-    -- Earlier toxic storms can leave every basin contaminated (old water or dry
-    -- residue); this phase tests fresh water, so start from a clean basin.
-    model_idle(ctx, F)
-    local stack, cleared = { basin }, 0
+    pour(ctx, F, { { basin.seed, basin.capacity * 0.6, 0 } })
+    -- The poured water may join a larger lake: the topmost ancestor holding
+    -- water (an ancestor can hold none of its own between full levels, so walk
+    -- all the way up). A lake seeps at its lowest point.
+    local surface = s.model.nodes[s.model.sinks[basin.seed]]
+    local up = surface
+    while up.parent and up.parent ~= 0 do
+        up = s.model.nodes[up.parent]
+        if up.water > 0 then surface = up end
+    end
+    -- Earlier toxic storms can leave every lake contaminated (old water or dry
+    -- residue); this phase tests fresh water, so clean the whole connected lake.
+    local stack, cleared = { surface }, 0
     while #stack > 0 do
         local n = table.remove(stack)
         if n.mass > 0 then cleared = cleared + n.mass; n.mass = 0 end
         for _, id in ipairs(n.children) do stack[#stack + 1] = s.model.nodes[id] end
     end
-    ctx:record("tracer_cleared_l", cleared)
-    pour(ctx, F, { { basin.seed, basin.capacity * 0.6, 0 } })
+    pour(ctx, F, {}) -- rebalance: refreshes the tracer totals
     F.Water.Snapshot()
     ctx:record("lake_depth_mm", (F.Water.DepthAt(lake:xy())))
-
-    -- Groundwater: a water deposit beside the lake. A lake seeps at its lowest
-    -- point; when earlier storms left water in the basin, the poured water joins
-    -- a larger lake, so the deposit goes beside that lake's lowest point.
-    local surface = s.model.nodes[s.model.sinks[basin.seed]]
-    while surface.parent and surface.parent ~= 0 and s.model.nodes[surface.parent].water > 0 do
-        surface = s.model.nodes[surface.parent]
-    end
-    ctx:record("seepage_point", { merged = surface.seed ~= basin.seed, distance_m = (at(F, surface.seed) - lake):Len2D() / guim,
+    ctx:record("seepage_point", { merged = surface.id ~= basin.id, distance_m = (at(F, surface.seed) - lake):Len2D() / guim,
         concentration = surface.total > 0 and surface.total_mass / surface.total or 0, map_frozen = F.Ice.MapFrozen(),
-        water_l = surface.total })
+        water_l = surface.total, tracer_cleared_l = cleared })
+
+    -- Groundwater: a water deposit beside the lake's lowest point.
     local deposit = PlaceObject("SubsurfaceDepositWater", nil, MainMap)
     deposit:SetPos(at(F, surface.seed) + point(40 * guim, 0, 0))
     deposit.max_amount = 1000 * const.ResourceScale
@@ -874,7 +878,16 @@ HARNESS.scenario("flood_70_ice", function(ctx)
     -- Only the largest pools are drawn; wait for lakes, give the redraw time to
     -- settle (after many storms every level moves, so its queue keeps refilling),
     -- then use the nearest drawn lake.
-    ctx:assert(ctx:wait_for(function() return next(s.markers) ~= nil end, 180000), "lakes drawn")
+    local drawn = ctx:wait_for(function() return next(s.markers) ~= nil end, 180000)
+    if not drawn then
+        ctx:record("no_lakes_diagnostics", { markers = table.count(s.markers), pools = s.pools and #s.pools or -1,
+            wet_pools = s.wet_pools, visible = s.visible_pools, backlog = s.render_backlog, retiring = #s.retiring,
+            wet = s.wet ~= false, job = s.rebuild_job ~= false, building = s.building, saving = s.saving,
+            enabled = s.enabled, paused = IsPaused(), refresh_ms = s.refresh_ms, error = tostring(s.error),
+            map_markers = #MainMap:MapGet("map", "FloodWaterMarker") })
+    end
+    ctx:assert(drawn, "lakes drawn")
+    if not drawn then ctx:fail("no lakes drawn") end
     -- Informational only (ctx:wait_for counts a timeout as a failed check).
     local settle_until = RealTime() + 60000
     while (s.render_backlog or 1) > 0 and RealTime() < settle_until do wait_real(500) end
@@ -1039,5 +1052,117 @@ HARNESS.scenario("flood_85_paused_water", function(ctx)
     ctx:assert(math.abs(H.Total(s.model) - water0) <= math.max(1, water0 * 0.001), "paused: stored water restored")
     ctx:capture("paused_water")
     Resume("FloodPausedWaterTest")
+    no_flood_error(ctx, "end")
+end)
+
+-- Terrain edits after the first read: no whole-map re-read, no pause.
+-- Silent edit: a pit dug the way the Excavator digs (terrain.SetHeightCircle,
+-- TheExcavator.lua:229; no message) must be found by the rolling check and
+-- rebuilt in the background while the simulation keeps running, keeping the
+-- drawn lakes. Announced edit: the vanilla flatten used for every construction
+-- (FlattenTerrainInBuildShape, as cables call it, ElectricityGrid.lua:1000) must
+-- queue its box at once.
+HARNESS.scenario("flood_90_terrain_edits", function(ctx)
+    local F = FL()
+    local s, cfg = F.State, F.Config
+    no_flood_error(ctx, "start")
+    -- Earlier scenarios can leave a popup the harness does not answer; record it.
+    -- Rebuilds also run while paused; only the "simulation kept stepping" check
+    -- needs a running game.
+    local blocked = popup_blocking(ctx)
+    if blocked then
+        local popup = GetDialog("PopupNotification")
+        local ctxt = popup and popup.context or {}
+        local keys = {}
+        for k, v in pairs(ctxt) do if type(v) ~= "table" and type(v) ~= "userdata" then keys[#keys + 1] = tostring(k) .. "=" .. tostring(v) end end
+        ctx:record("unanswered_popup", table.concat(keys, "; "))
+    end
+    local running = not IsPaused()
+    ctx:record("paused_at_start", not running)
+    cfg.ICE_PLANET_COLD = false
+    local basin = pick_basin(ctx, F)
+    if not basin then ctx:fail("no suitable basin") end
+    pour(ctx, F, { { basin.seed, basin.capacity * 0.6, 0 } })
+    ctx:assert(ctx:wait_for(function() return next(s.markers) ~= nil end, 180000), "lakes drawn")
+    local terrain0 = s.terrain
+    local objs = {}
+    for _, e in pairs(s.markers) do if IsValid(e.obj) then objs[e.obj] = true end end
+
+    -- Silent edit on the highest ground (dry), at the cell's lowest sampled point:
+    -- a cell stores the lowest of its samples, so a dent above that point is
+    -- (correctly) not a change.
+    local cell = highest_cell(F)
+    local spot = point(F.Terrain.LowPoint(s.terrain, cell))
+    local before = s.terrain.elevations[cell]
+    local ground = terrain.GetHeight(MainMap, spot)
+    -- As vanilla digging does (RegolithExtractor.lua:716-724), inside suspended pass edits.
+    MainMap:SuspendPassEdits("FloodTerrainEditTest")
+    terrain.SetHeightCircle(MainMap, spot, 20 * guim, 30 * guim, ground - 8 * guim, const.hsMin)
+    MainMap:ResumePassEdits("FloodTerrainEditTest")
+    ctx:record("dig", { ground = ground, after = terrain.GetHeight(MainMap, spot) })
+    ctx:assert(terrain.GetHeight(MainMap, spot) < ground, "pit dug")
+    local model0, last_tick0 = s.model, s.last_tick
+    SetTimeFactor(const.DefaultTimeFactor * 10)
+    ctx:assert(ctx:wait_for(function() return s.rebuild_job or s.model ~= model0 end, 300000),
+        "rolling check found the silent edit; background rebuild started")
+    local ran_during, job_last_tick = false, s.last_tick
+    ctx:assert(ctx:wait_for(function()
+        if s.rebuild_job and not s.building and s.last_tick ~= job_last_tick then ran_during = true end
+        return s.model ~= model0 and not s.rebuild_job
+    end, 300000), "background rebuild finished")
+    local kept = 0
+    for _, e in pairs(s.markers) do if objs[e.obj] then kept = kept + 1 end end
+    ctx:record("silent_edit", { cell_before = before, cell_after = s.model.elevations[cell],
+        rebuild = s.last_terrain_rebuild, markers_before = table.count(objs), markers_kept = kept })
+    ctx:assert(s.terrain == terrain0, "terrain read once: the stored terrain was updated in place, not re-read")
+    ctx:assert(s.model.elevations[cell] < before, "new model has the pit")
+    if running then
+        ctx:assert(ran_during and s.last_tick ~= last_tick0, "simulation kept running during the rebuild")
+    end
+    ctx:assert(s.last_terrain_rebuild and s.last_terrain_rebuild.background and s.last_terrain_rebuild.max_slice_ms <= 100,
+        "no long stall: every rebuild slice under 100 ms")
+    ctx:assert(kept > 0, "drawn lakes kept their markers across the rebuild")
+
+    -- Announced edit: flatten one hex through the real vanilla function, on
+    -- buildable ground near the pit (on the pit itself vanilla returns an error
+    -- string, which must not queue anything).
+    local probe = PlaceObject("RCRover", nil, MainMap)
+    probe:SetPos(spot)
+    local boxes0 = #s.terrain_boxes
+    local refused = FlattenTerrainInBuildShape(nil, probe)
+    ctx:record("flatten_on_pit", tostring(refused))
+    ctx:assert(IsBox(refused) or #s.terrain_boxes == boxes0, "a refused flatten queues nothing")
+    local announced, tries = false, 0
+    local buildable = MainMap.buildable
+    local base = at(F, basin.seed)
+    for r = 60, 1200, 60 do
+        for _, dir in ipairs({ { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }) do
+            if not announced then
+                local p = base + point(dir[1] * r * guim, dir[2] * r * guim, 0)
+                local q, hr = WorldToHex(p)
+                if terrain.IsPointInBounds(MainMap, p) and buildable:IsBuildable(q, hr)
+                    and F.Water.DepthAt(p:xy()) == 0 then
+                    tries = tries + 1
+                    probe:SetPos(p)
+                    local n0 = #s.terrain_boxes
+                    if IsBox(FlattenTerrainInBuildShape(nil, probe)) then announced = #s.terrain_boxes > n0 end
+                end
+            end
+        end
+    end
+    ctx:record("flatten_tries", tries)
+    ctx:assert(announced, "construction flattening announced its box at once")
+    local model1 = s.model
+    ctx:wait_for(function() return #s.terrain_boxes == 0 end, 60000)
+    local changed = s.terrain_changed
+    ctx:record("announced_edit", { heights_changed = changed })
+    if changed then
+        ctx:assert(ctx:wait_for(function() return s.model ~= model1 and not s.rebuild_job end, 300000),
+            "announced edit rebuilt in the background")
+        ctx:record("announced_rebuild", s.last_terrain_rebuild)
+        ctx:assert(s.terrain == terrain0, "still no whole-map re-read")
+    end
+    SetTimeFactor(const.DefaultTimeFactor)
+    if IsValid(probe) then DoneObject(probe) end
     no_flood_error(ctx, "end")
 end)

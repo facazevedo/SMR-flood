@@ -140,4 +140,39 @@ do
     assert(seconds < 1, 'dry WetCells + Step on 384x384 too slow: ' .. seconds .. ' s')
     count = count + 1
 end
+-- A yielding build (merge sort, sliced loops) equals the plain one, including
+-- ties: many equal heights, as on flattened ground.
+do
+    local w, heights = 61, {}
+    for i = 1, w * w do heights[i] = math.random(0, 12) * 250 end
+    local plain = H.Build(w, w, heights, 16)
+    local yields = 0
+    local sliced = H.Build(w, w, heights, 16, function() yields = yields + 1 end)
+    assert(yields > 0, 'yielding build never yielded')
+    assert(#plain.nodes == #sliced.nodes and #plain.roots == #sliced.roots, 'node counts differ')
+    for i, a in ipairs(plain.nodes) do
+        local b = sliced.nodes[i]
+        assert(a.seed == b.seed and a.parent == b.parent and a.spill == b.spill and a.capacity == b.capacity
+            and a.base == b.base and a.catchment == b.catchment, 'node ' .. i .. ' differs')
+    end
+    for i = 1, w * w do assert(plain.sinks[i] == sliced.sinks[i], 'sink ' .. i .. ' differs') end
+    count = count + 1
+    -- Restoring and exporting with yields give the same water and tracer.
+    local records = {}
+    for i = 1, w * w, 7 do records[#records + 1] = { i, 50000 + (i % 13) * 9000, (i % 5) * 4000 } end
+    H.Import(plain, records)
+    local yields2 = 0
+    H.Import(sliced, records, function() yields2 = yields2 + 1 end)
+    for i, a in ipairs(plain.nodes) do
+        local b = sliced.nodes[i]
+        assert(a.water == b.water and a.mass == b.mass and a.total == b.total, 'restored node ' .. i .. ' differs')
+    end
+    local e1 = H.Export(plain)
+    local e2 = H.Export(sliced, function() yields2 = yields2 + 1 end)
+    assert(#e1 == #e2, 'export sizes differ')
+    local by_cell = {}
+    for _, r in ipairs(e1) do by_cell[r[1] .. ':' .. r[2]] = r[3] end
+    for _, r in ipairs(e2) do assert(by_cell[r[1] .. ':' .. r[2]] == r[3], 'export record differs') end
+    count = count + 1
+end
 print('PASS: ' .. count .. ' hydrology assertions')

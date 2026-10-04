@@ -68,6 +68,8 @@ function OnSoilGridChanged() soil_changed = soil_changed + 1 end
 local terraform = { Atmosphere = 0, Temperature = 0 }
 function GetTerraformParamPct(name) return terraform[name] end
 function Sleep() end
+local real_time = 0
+function RealTime() return real_time end
 function GetPreciseTicks() return 0 end
 function RGB() return 0 end
 function RGBA() return 0 end
@@ -117,6 +119,23 @@ local function dusty(o, max)
     function o:IsDead() return false end
     return o
 end
+
+local Box = {}
+Box.__index = Box
+function Box:minx() return self[1] end
+function Box:miny() return self[2] end
+function Box:maxx() return self[3] end
+function Box:maxy() return self[4] end
+function box(x1, y1, x2, y2) return setmetatable({ x1, y1, x2, y2 }, Box) end
+function IsBox(b) return getmetatable(b) == Box end
+-- Vanilla flatten (Construction.lua:2474): returns the flattened world box.
+local flatten_calls = 0
+function FlattenTerrainInBuildShape(shape_data, obj, flatten_unbuildable)
+    flatten_calls = flatten_calls + 1
+    return obj.flat_box, "extra"
+end
+local vanilla_flatten = FlattenTerrainInBuildShape
+CurrentModDef = {} -- the sandbox's per-mod ModDef (Mod.lua SetupEnv)
 
 -- Load the payload in metadata order; the entry file only registers OnMsg handlers.
 OnMsg = {}
@@ -378,61 +397,168 @@ for _ = 1, 40 do
     F.Lifecycle.Tick()
     game_time = game_time + F.Config.TICK_MS
 end
--- The first tick builds the model (one slice: the stub clock never advances) and
--- does nothing else; the other 39 run the effects.
-check(s.model and s.last_effects and s.ticks == 39 and not s.building, "lifecycle ticks with all effects")
+-- The first tick reads the terrain and builds the model (one slice: the stub
+-- clock never advances), then runs the full tick; so do the other 39.
+check(s.model and s.terrain and s.last_effects and s.ticks == 40 and not s.building, "lifecycle ticks with all effects")
 
--- Terrain rebuild job: sliced across ticks by real time, old model kept meanwhile.
+-- Terrain: read once, then only changed areas; background rebuilds.
 do
     local real_clock = GetPreciseTicks
     local clock = 0
     GetPreciseTicks = function() clock = clock + F.Config.REBUILD_SLICE_MS; return clock end -- one resume per slice
     local yield_rows = F.Config.SAMPLE_YIELD_ROWS
     F.Config.SAMPLE_YIELD_ROWS = 1 -- the stub grid is small: yield every row
-    local old_model = s.model
-    s.grid, s.dirty = false, true -- the next tick rescans and sees changed terrain
-    F.Lifecycle.Tick()
-    check(s.rebuild_job and s.building and s.model == old_model, "rebuild runs as a job and keeps the old model")
-    local ticks_before, slices = s.ticks, 1
-    while s.rebuild_job and slices < 10000 do F.Lifecycle.Tick(); slices = slices + 1 end
-    check(not s.rebuild_job and not s.building and s.model ~= old_model and s.grid, "rebuild job finishes and installs")
-    check(slices > 1 and s.ticks == ticks_before, "rebuild spans several slices with no effect passes")
-    s.grid, s.dirty = false, true
-    F.Lifecycle.Tick()
-    check(s.rebuild_job, "second rebuild started")
+    -- Game time and real time advance together here (normal speed).
+    local function full_ticks(n)
+        for _ = 1, n do
+            F.Lifecycle.Tick(); game_time = game_time + F.Config.TICK_MS; real_time = real_time + F.Config.TICK_MS
+        end
+    end
+    local function settle()
+        local guard = 0
+        repeat
+            F.Lifecycle.Tick(); guard = guard + 1
+            game_time = game_time + F.Config.REBUILD_SLICE_SLEEP_MS; real_time = real_time + F.Config.REBUILD_SLICE_SLEEP_MS
+        until (not s.rebuild_job and not s.terrain_changed and #s.terrain_boxes == 0) or guard > 20000
+    end
+
+    -- Unchanged terrain: no rebuild, however long it runs (the rolling check
+    -- covers the whole map many times over).
+    local model0, reads = s.model, 0
+    local real_get = terrain.GetHeight
+    terrain.GetHeight = function(...) reads = reads + 1; return real_get(...) end
+    full_ticks(40)
+    check(s.model == model0 and not s.rebuild_job and not s.terrain_changed, "unchanged terrain: no rebuild")
+    check(reads <= 40 * F.Config.TERRAIN_CHECK_ROWS_PER_TICK * W, "only the rolling rows are read per tick")
+    terrain.GetHeight = real_get
+
+    -- An announced edit (construction flattening): only its box is read, the
+    -- model is rebuilt in the background while the simulation keeps running.
+    local wall = 5 * W + 3 -- a cell on the bowl's flank, raised into a wall
+    z[wall] = z[wall] + 5000
+    local site = { valid = true, flat_box = box(2 * cell, 4 * cell, 3 * cell - 1, 5 * cell - 1) }
+    function site:GetMap() return MainMap end
+    local r1, r2 = FlattenTerrainInBuildShape(nil, site, true)
+    check(FlattenTerrainInBuildShape ~= vanilla_flatten and flatten_calls == 1 and r1 == site.flat_box and r2 == "extra",
+        "flatten wrapper passes every result through")
+    check(#s.terrain_boxes == 1, "flattened box queued for a re-read")
+    -- Reloading the mod's code must not wrap the wrapper.
+    local wrapper = FlattenTerrainInBuildShape
+    local terrain_module = F.Terrain
+    dofile("Code/fl_terrain.lua")
+    for k, v in pairs(F.Terrain) do terrain_module[k] = v end
+    F.Terrain = terrain_module
+    check(FlattenTerrainInBuildShape ~= wrapper and CurrentModDef.FloodVanillaFlatten == vanilla_flatten,
+        "reload rewraps the vanilla function, not the wrapper")
+    local calls0 = flatten_calls
+    s.terrain_boxes = {}
+    FlattenTerrainInBuildShape(nil, site)
+    check(flatten_calls == calls0 + 1 and #s.terrain_boxes == 1, "after a reload one flatten queues one box")
+    -- A flatten that fails returns an error string: passed through, nothing queued.
+    local failed = { valid = true, flat_box = "Trying to build on unbuildable grid location" }
+    function failed:GetMap() return MainMap end
+    s.terrain_boxes = {}
+    check(FlattenTerrainInBuildShape(nil, failed) == failed.flat_box and #s.terrain_boxes == 0,
+        "failed flatten: error passed through, nothing queued")
+    F.Terrain.MarkChanged(MainMap, nil, "test")
+    check(#s.terrain_boxes == 0, "edit messages without a box are ignored")
+    FlattenTerrainInBuildShape(nil, site)
+    local ticks0, last_tick0 = s.ticks, s.last_tick
+    full_ticks(1)
+    check(s.terrain_changed and #s.terrain_boxes == 0, "edit box read: heights changed")
+    check(s.terrain.elevations[wall] == z[wall] * guim / 1000 * 1000.0 / guim, "stored terrain updated in place")
+    local waited = 0
+    while not s.rebuild_job and waited < 20 do full_ticks(1); waited = waited + 1 end
+    check(s.rebuild_job and s.rebuild_job.background and not s.building and s.model == model0
+        and waited * F.Config.TICK_MS >= F.Config.TERRAIN_SETTLE_MS, "background rebuild starts after the settle time; model still in use")
+    -- The stub grid is tiny: make the build yield like a real map's does.
+    local real_build = F.Hydrology.Build
+    F.Hydrology.Build = function(w, h, e, a, yield_fn)
+        for _ = 1, 200 do yield_fn() end
+        return real_build(w, h, e, a, yield_fn)
+    end
+    local stepped = false
+    local guard = 0
+    while s.rebuild_job and guard < 20000 do
+        F.Lifecycle.Tick(); guard = guard + 1
+        game_time = game_time + F.Config.REBUILD_SLICE_SLEEP_MS; real_time = real_time + F.Config.REBUILD_SLICE_SLEEP_MS
+        if s.rebuild_job and not s.building and s.last_tick ~= last_tick0 then stepped = true end
+    end
+    F.Hydrology.Build = real_build
+    check(stepped and s.ticks > ticks0, "simulation and effects keep running during the background build")
+    check(s.model ~= model0 and s.model.elevations[wall] == s.terrain.elevations[wall] and not s.building,
+        "new model installed from the stored terrain")
+    check(math.abs(F.Hydrology.Total(s.model) - F.Hydrology.Total(model0)) < 1, "water carried over at the handover")
+
+    -- A silent edit (no message): found by the rolling check within one cycle.
+    local model1 = s.model
+    local pit = 2 * W + 8
+    z[pit] = z[pit] - 3000
+    full_ticks(math.ceil(Hgt / F.Config.TERRAIN_CHECK_ROWS_PER_TICK) + 1)
+    check(s.terrain_changed or s.rebuild_job or s.model ~= model1, "rolling check finds a silent edit")
+    settle()
+    check(s.model ~= model1 and s.model.elevations[pit] == s.terrain.elevations[pit], "silent edit rebuilt in the background")
+
+    -- Cancelling a background job keeps the model and retries later.
+    z[wall] = z[wall] - 5000
+    FlattenTerrainInBuildShape(nil, site)
+    full_ticks(math.ceil(F.Config.TERRAIN_SETTLE_MS / F.Config.TICK_MS) + 2)
+    check(s.rebuild_job, "another background rebuild started")
+    local model2 = s.model
     F.Terrain.CancelRebuild()
-    check(not s.rebuild_job and not s.building and s.dirty == true, "cancel drops the job and rescans later")
+    check(not s.rebuild_job and not s.building and s.model == model2 and s.terrain_changed, "cancel keeps the model and retries")
     F.Terrain.CancelRebuild()
     check(not s.rebuild_job, "cancel is idempotent")
+    settle()
+    check(s.model ~= model2 and not s.terrain_changed, "retried rebuild finished")
+
     -- A failing job raises its error and leaves no job behind.
-    local real_sample = F.Terrain.Sample
-    F.Terrain.Sample = function() error("sample exploded") end
+    local real_build = F.Hydrology.Build
+    F.Hydrology.Build = function() error("build exploded") end
     F.Terrain.StartRebuild(MainMap)
     local ok, err = pcall(F.Terrain.StepRebuild)
-    check(not ok and tostring(err):find("sample exploded", 1, true) and not s.rebuild_job and not s.building,
+    check(not ok and tostring(err):find("build exploded", 1, true) and not s.rebuild_job and not s.building,
         "failed rebuild raises and cancels")
-    F.Terrain.Sample = real_sample
-    -- Paused: the paused tick finishes a scan and draws, but never steps water.
-    while s.dirty or s.rebuild_job do F.Lifecycle.Tick() end
+    F.Hydrology.Build = real_build
+    s.terrain_changed = false
+
+    -- An edit made while paused (construction can be placed while paused) is
+    -- rebuilt while still paused: the settle time is real time.
+    local model3, game_time_paused = s.model, game_time
+    z[wall] = z[wall] + 4000
+    FlattenTerrainInBuildShape(nil, site)
+    local paused_calls = 0
+    repeat
+        F.Lifecycle.PausedTick(); paused_calls = paused_calls + 1
+        real_time = real_time + F.Config.PAUSED_TICK_MS
+    until (s.model ~= model3 and not s.rebuild_job) or paused_calls > 20000
+    check(s.model ~= model3 and game_time == game_time_paused, "edit made while paused is rebuilt while paused")
+
+    -- Paused, as after loading a save that opens paused: no model, no terrain.
+    -- The paused tick reads the terrain, builds, restores the saved water and
+    -- draws, but never steps water or runs effects.
     local total, last_tick, effect_ticks = F.Hydrology.Total(s.model), s.last_tick, s.ticks
-    s.grid, s.dirty = false, true
+    F.Save.Capture()
+    F.Terrain.Reset()
+    s.model, s.grid, s.wet = false, false, false
     GeneratingMap = true
     F.Lifecycle.PausedTick()
-    check(not s.rebuild_job, "paused tick waits while a map is being generated")
+    check(not s.rebuild_job and not s.terrain, "paused tick waits while a map is being generated")
     GeneratingMap = nil
     local paused_slices = 0
-    repeat F.Lifecycle.PausedTick(); paused_slices = paused_slices + 1 until not s.rebuild_job or paused_slices > 10000
-    check(not s.rebuild_job and not s.dirty and s.grid and paused_slices > 1, "paused tick finishes a terrain scan")
-    check(s.wet == false, "finished scan leaves the snapshot to the next draw")
+    repeat F.Lifecycle.PausedTick(); paused_slices = paused_slices + 1 until s.model or paused_slices > 10000
+    check(s.model and s.terrain and s.grid and paused_slices > 1, "paused tick reads the terrain and builds")
+    check(math.abs(F.Hydrology.Total(s.model) - total) < 1, "paused build restores the saved water")
     F.Lifecycle.PausedTick()
     check(s.wet ~= false, "paused tick draws the water")
-    check(math.abs(F.Hydrology.Total(s.model) - total) < 1e-6 and s.last_tick == last_tick and s.ticks == effect_ticks,
-        "paused tick never steps water or runs effects")
+    check(s.last_tick == last_tick and s.ticks == effect_ticks, "paused tick never steps water or runs effects")
     s.enabled = false
-    s.grid, s.dirty = false, true
+    F.Terrain.Reset()
+    s.model = false
     F.Lifecycle.PausedTick()
     check(not s.rebuild_job, "paused tick does nothing while Flood is disabled")
     s.enabled = true
+    settle()
     GetPreciseTicks = real_clock
     F.Config.SAMPLE_YIELD_ROWS = yield_rows
 end
