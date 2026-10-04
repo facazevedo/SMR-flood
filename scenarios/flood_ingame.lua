@@ -40,6 +40,19 @@ local function pour(ctx, F, records)
     F.Hydrology.Import(F.State.model, records)
 end
 
+-- Names of the reasons the game is paused (a reason can be a dialog object).
+local function pause_reasons()
+    local names = {}
+    for reason in pairs(rawget(_G, "PauseReasons") or {}) do
+        if type(reason) == "table" then
+            names[#names + 1] = tostring(rawget(reason, "class") or reason.class or rawget(reason, "Id") or "table")
+        else
+            names[#names + 1] = tostring(reason)
+        end
+    end
+    return table.concat(names, ",")
+end
+
 local function popup_blocking(ctx)
     local popup = GetDialog("PopupNotification")
     if not popup then return false end
@@ -60,11 +73,19 @@ end
 local function wait_effect_passes(ctx, n, timeout_ms)
     local s = FL().State
     local seen, last = 0, s.last_effects
-    return ctx:wait_for(function()
+    local ok = ctx:wait_for(function()
         if popup_blocking(ctx) then return true end
         if s.last_effects ~= last then seen = seen + 1; last = s.last_effects end
         return seen >= n
     end, timeout_ms or 120000)
+    if not ok then
+        ctx:record("effect_wait_timeout", { seen = seen, paused = IsPaused(), game_time = GameTime(),
+            last_effects = s.last_effects, last_full_tick = s.last_full_tick, last_tick = s.last_tick, ticks = s.ticks,
+            enabled = s.enabled, thread = IsValidThread(s.thread), job = s.rebuild_job ~= false, building = s.building,
+            snapshot_pending = FL().Water.SnapshotPending(),
+            time_factor = GetTimeFactor(), error = tostring(s.error) })
+    end
+    return ok
 end
 
 local function no_flood_error(ctx, where)
@@ -171,7 +192,14 @@ HARNESS.scenario("flood_10_rain", function(ctx)
     end, 15000), "panel shows Stop Heavy")
     SetTimeFactor(const.DefaultTimeFactor * 10)
     local t0 = GameTime()
-    ctx:wait_for(function() return GameTime() - t0 >= 3 * const.HourDuration end, 180000)
+    local worst_snapshot, worst_redraw = 0, 0
+    ctx:wait_for(function()
+        worst_snapshot = math.max(worst_snapshot, s.snapshot_step_ms or 0)
+        worst_redraw = math.max(worst_redraw, s.refresh_ms or 0)
+        return GameTime() - t0 >= 3 * const.HourDuration
+    end, 180000)
+    ctx:record("worst_step_ms", { snapshot = worst_snapshot, redraw = worst_redraw })
+    ctx:assert(worst_snapshot <= 30, "depth snapshot ran in short steps during the storm")
     local after = H.Total(s.model)
     ctx:record("water_m3_after_3h_heavy", after / 1000)
     ctx:record("visible_pools", s.visible_pools or 0)
@@ -528,10 +556,11 @@ HARNESS.scenario("flood_40_ground_and_people", function(ctx)
     -- Toxic: contaminate all water fully (earlier storms may have left fresh water in
     -- other basins within recharge range); soil falls, the deposit no longer gains.
     model_idle(ctx, F)
+    -- Into every lake at its own lowest cell, so the tracer spreads through its water
+    -- (a basin tree's lowest cell can be a dry basin elsewhere).
     local contaminate = {}
-    for _, id in ipairs(s.model.roots) do
-        local root = s.model.nodes[id]
-        if root.total > root.total_mass then contaminate[#contaminate + 1] = { root.seed, 0, root.total - root.total_mass } end
+    for _, pool in ipairs(H.Pools(s.model)) do
+        if pool.volume > pool.mass then contaminate[#contaminate + 1] = { pool.seed, 0, pool.volume - pool.mass } end
     end
     pour(ctx, F, contaminate)
     local deposit_toxic = deposit.amount
@@ -964,56 +993,76 @@ HARNESS.scenario("flood_70_ice", function(ctx)
     no_flood_error(ctx, "end")
 end)
 
--- The panel's Frost button: pressed through the real button, On ices a drawn
--- lake (walkable at the water level), Off thaws it, the third press returns to Auto.
-HARNESS.scenario("flood_80_frost_button", function(ctx)
+-- The panel's Cold Wave button: pressed through the real button, it starts a
+-- vanilla cold wave; as the heat grid cools below the freezing heat, drawn lakes
+-- ice over (in small batches); the second press ends the wave and, as it warms,
+-- the ice melts.
+HARNESS.scenario("flood_80_cold_wave_button", function(ctx)
     local F = FL()
-    local s, H = F.State, F.Hydrology
+    local s, cfg = F.State, F.Config
     no_flood_error(ctx, "start")
+    cfg.ICE_PLANET_COLD = false -- liquid water to start with: only the cold wave freezes
     local panel = s.ui
-    ctx:assert(panel and panel.idFrost, "panel has the Frost button")
-    if not (panel and panel.idFrost) then ctx:fail("no Frost button") end
-    local function press() panel.idFrost:OnPress() end
-    local function label() return tostring(panel.idFrost.Text) end -- XTextButton:SetText stores it (XButton.lua:459)
-    ctx:record("label_auto", label())
+    ctx:assert(panel and panel.idColdWave, "panel has the Cold Wave button")
+    if not (panel and panel.idColdWave) then ctx:fail("no Cold Wave button") end
+    local function press() panel.idColdWave:OnPress() end
+    local function label() return tostring(panel.idColdWave.Text) end -- XTextButton:SetText stores it (XButton.lua:459)
+    ctx:assert(not rawget(_G, "g_ColdWave"), "no cold wave under way")
     local basin = pick_basin(ctx, F)
     if not basin then ctx:fail("no suitable basin") end
     pour(ctx, F, { { basin.seed, basin.capacity * 0.6, 0 } })
-    F.Water.Snapshot()
-    ctx:assert(ctx:wait_for(function() return (s.render_backlog or 1) == 0 and next(s.markers) ~= nil end, 180000),
-        "lakes drawn")
+    ctx:assert(ctx:wait_for(function() return next(s.markers) ~= nil end, 180000), "lakes drawn")
     local lake = at(F, basin.seed)
-    local x, y = lake:xy()
-    local entry
+    local heat0 = GetHeatAtXY(lake:xy())
+
+    press()
+    ctx:assert(F.ColdWave.Active() and label():find("Cold wave: On", 1, true), "first press: cold wave on")
+    SetTimeFactor(const.DefaultTimeFactor * 10)
+    ctx:assert(ctx:wait_for(function() return rawget(_G, "g_ColdWave") ~= false end, 30000), "vanilla cold wave under way")
+    local worst, last = 0, nil
+    -- Ice spreads plate by plate within its budget (realistically slowly across a
+    -- whole frozen map): check that it forms smoothly rather than wait for all.
+    local iced = ctx:wait_for(function()
+        popup_blocking(ctx)
+        if s.ice_refresh_ms and s.ice_refresh_ms ~= last then last = s.ice_refresh_ms; worst = math.max(worst, last) end
+        return (s.frozen_pools or 0) > 0 and ((s.ice_plates or 0) >= 300 or ((s.ice_plates or 0) > 0 and (s.ice_backlog or 1) == 0))
+    end, 300000)
+    ctx:record("cold", { heat_before = heat0, heat_at_lake = GetHeatAtXY(lake:xy()), freeze_heat = cfg.ICE_FREEZE_HEAT,
+        frozen_pools = s.frozen_pools, plates = s.ice_plates, worst_ice_refresh_ms = worst, label = label() })
+    ctx:assert(iced, "the cold wave froze lakes (walkable ice)")
+    ctx:record("worst_ice_batch_ms", s.ice_worst_batch_ms)
+    ctx:record("ice_phase_max_ms", s.ice_phase_max_ms)
+    ctx:assert(worst <= 60, "every ice refresh stayed short (at most 60 ms under the debugger)")
+    -- Shore first: on the largest iced lake, the first quarter of the plates laid
+    -- sits in shallower water than the last quarter.
+    local big
     for _, e in pairs(s.markers) do
-        if IsValid(e.obj) and e.x and (not entry or math.abs(e.x - x) + math.abs(e.y - y)
-            < math.abs(entry.x - x) + math.abs(entry.y - y)) then entry = e end
+        if e.ice and #e.ice.plates >= 8 and (not big or #e.ice.plates > #big.ice.plates) then big = e end
     end
-    local water_z = select(3, entry.obj:GetVisualPosXYZ()) + (entry.obj.zoffset or 0)
-    local bed_z = GetWalkableZ(MainMap, entry.x, entry.y)
+    if big then
+        local plates, z = big.ice.plates, big.ice.plate_z
+        local quarter = #plates // 4
+        local function mean_depth(i0, i1)
+            local sum = 0
+            for i = i0, i1 do sum = sum + (z - terrain.GetHeight(MainMap, plates[i]:GetPos())) end
+            return sum / (i1 - i0 + 1)
+        end
+        local first, last = mean_depth(1, quarter), mean_depth(#plates - quarter + 1, #plates)
+        ctx:record("shore_first", { plates = #plates, first_quarter_depth = first, last_quarter_depth = last })
+        ctx:assert(first < last, "ice laid from the shore towards the deep middle")
+    end
+    ctx:capture("cold_wave")
 
     press()
-    ctx:assert(F.Ice.TestFrost() == "on" and label():find("Frost: On", 1, true), "first press: frost on")
-    ctx:assert(ctx:wait_for(function() return entry.ice and #entry.ice.plates > 0 and (s.ice_backlog or 1) == 0 end,
-        300000), "frost on: the lake iced over")
-    local ice_z = GetWalkableZ(MainMap, entry.x, entry.y)
-    ctx:record("frost_on", { water_z = water_z, bed_z = bed_z, ice_z = ice_z, plates = s.ice_plates,
-        frozen_pools = s.frozen_pools, label = label() })
-    ctx:assert(math.abs(ice_z - water_z) <= guim / 2 and entry.frozen == true, "frost on: walkable ice at the water level")
-    ctx:capture("frost_on")
-
-    press()
-    ctx:assert(F.Ice.TestFrost() == "off" and label():find("Frost: Off", 1, true), "second press: frost off")
-    ctx:assert(ctx:wait_for(function() return (s.ice_plates or 0) == 0 and (s.ice_backlog or 1) == 0 end, 300000),
-        "frost off: all ice removed")
-    local thaw_z = GetWalkableZ(MainMap, entry.x, entry.y)
-    ctx:record("frost_off", { walkable_z = thaw_z, frozen_pools = s.frozen_pools, label = label() })
-    ctx:assert(thaw_z < water_z - guim / 2 and entry.frozen == false and s.frozen_pools == 0,
-        "frost off: liquid lake, walkable surface back on the lakebed")
-
-    press()
-    ctx:assert(F.Ice.TestFrost() == "auto" and label():find("Frost: Auto", 1, true), "third press: frost auto")
-    ctx:record("label_back_to_auto", label())
+    ctx:assert(not F.ColdWave.Active() and label():find("Cold wave: Off", 1, true), "second press: cold wave off")
+    ctx:assert(ctx:wait_for(function() return rawget(_G, "g_ColdWave") == false end, 30000), "vanilla cold wave ended")
+    local melted = ctx:wait_for(function()
+        popup_blocking(ctx)
+        return (s.ice_plates or 0) == 0 and (s.ice_backlog or 1) == 0
+    end, 600000)
+    ctx:record("warm", { heat_at_lake = GetHeatAtXY(lake:xy()), frozen_pools = s.frozen_pools, plates = s.ice_plates })
+    ctx:assert(melted, "after the cold wave the ice melted")
+    SetTimeFactor(const.DefaultTimeFactor)
     no_flood_error(ctx, "end")
 end)
 
@@ -1105,18 +1154,21 @@ HARNESS.scenario("flood_90_terrain_edits", function(ctx)
     SetTimeFactor(const.DefaultTimeFactor * 10)
     ctx:assert(ctx:wait_for(function() return s.rebuild_job or s.model ~= model0 end, 300000),
         "rolling check found the silent edit; background rebuild started")
-    local ran_during, job_last_tick = false, s.last_tick
+    local ran_during, job_last_tick, paused_during = false, s.last_tick, false
     ctx:assert(ctx:wait_for(function()
         if s.rebuild_job and not s.building and s.last_tick ~= job_last_tick then ran_during = true end
+        if s.rebuild_job and IsPaused() then paused_during = pause_reasons() end
         return s.model ~= model0 and not s.rebuild_job
     end, 300000), "background rebuild finished")
+    ctx:record("paused_during_rebuild", paused_during)
     local kept = 0
     for _, e in pairs(s.markers) do if objs[e.obj] then kept = kept + 1 end end
     ctx:record("silent_edit", { cell_before = before, cell_after = s.model.elevations[cell],
         rebuild = s.last_terrain_rebuild, markers_before = table.count(objs), markers_kept = kept })
     ctx:assert(s.terrain == terrain0, "terrain read once: the stored terrain was updated in place, not re-read")
     ctx:assert(s.model.elevations[cell] < before, "new model has the pit")
-    if running then
+    -- Only meaningful while the game runs (rebuilds also run while paused).
+    if running and not paused_during then
         ctx:assert(ran_during and s.last_tick ~= last_tick0, "simulation kept running during the rebuild")
     end
     ctx:assert(s.last_terrain_rebuild and s.last_terrain_rebuild.background and s.last_terrain_rebuild.max_slice_ms <= 100,
@@ -1164,5 +1216,81 @@ HARNESS.scenario("flood_90_terrain_edits", function(ctx)
     end
     SetTimeFactor(const.DefaultTimeFactor)
     if IsValid(probe) then DoneObject(probe) end
+    no_flood_error(ctx, "end")
+end)
+
+-- The panel's Terraformed button: On applies full terraforming through the
+-- vanilla parameters (liquid water, breathable air, cold waves and dust storms
+-- stopped), Off restores the starting values. Then, with the planet's water
+-- frozen again, ice forms in small batches: the longest single ice refresh is
+-- recorded and must stay short.
+HARNESS.scenario("flood_95_terraformed_button", function(ctx)
+    local F = FL()
+    local s, cfg = F.State, F.Config
+    no_flood_error(ctx, "start")
+    local panel = s.ui
+    ctx:assert(panel and panel.idTerraform, "panel has the Terraformed button")
+    if not (panel and panel.idTerraform) then ctx:fail("no Terraformed button") end
+    local function press() panel.idTerraform:OnPress() end
+    local function label() return tostring(panel.idTerraform.Text) end
+    local before = {}
+    for name in pairs(TerraformingParamDefs) do before[name] = GetTerraformParamPct(name) end
+    local initial = { water_frozen = rawget(_G, "WaterFrozen"), breathable = GetAtmosphereBreathable(MainMap),
+        cold_waves_disabled = rawget(_G, "ColdWavesDisabled") }
+    ctx:record("initial", { params = before, conditions = initial, label = label() })
+
+    press()
+    local on = {}
+    for name in pairs(TerraformingParamDefs) do on[name] = GetTerraformParamPct(name) end
+    local conditions_on = { water_frozen = rawget(_G, "WaterFrozen"), breathable = GetAtmosphereBreathable(MainMap),
+        cold_waves_disabled = rawget(_G, "ColdWavesDisabled"), dust_storms_disabled = rawget(_G, "DustStormsDisabled") }
+    ctx:record("terraformed", { params = on, conditions = conditions_on, label = label() })
+    local all_full = true
+    for _, pct in pairs(on) do if pct < 100 then all_full = false end end
+    ctx:assert(F.Terraforming.Active() and label():find("Terraformed: On", 1, true), "first press: terraformed on")
+    ctx:assert(all_full, "every terraforming parameter at 100 %")
+    ctx:assert(conditions_on.water_frozen ~= true and conditions_on.breathable == true and conditions_on.cold_waves_disabled == true,
+        "full terraforming: liquid water, breathable air, no cold waves")
+
+    press()
+    local after = {}
+    local restored = true
+    for name in pairs(TerraformingParamDefs) do
+        after[name] = GetTerraformParamPct(name)
+        if after[name] ~= before[name] then restored = false end
+    end
+    local conditions_off = { water_frozen = rawget(_G, "WaterFrozen"), breathable = GetAtmosphereBreathable(MainMap),
+        cold_waves_disabled = rawget(_G, "ColdWavesDisabled") }
+    ctx:record("restored", { params = after, conditions = conditions_off, label = label() })
+    ctx:assert(not F.Terraforming.Active() and label():find("Terraformed: Off", 1, true), "second press: terraformed off")
+    ctx:assert(restored, "every terraforming parameter back to its starting value")
+    ctx:assert(conditions_off.water_frozen == initial.water_frozen and conditions_off.breathable == initial.breathable
+        and conditions_off.cold_waves_disabled == initial.cold_waves_disabled, "starting conditions restored")
+
+    -- Ice smoothness: the planet's water is frozen again (unterraformed test map),
+    -- so with planet ice on every drawn lake freezes; watch each refresh's cost.
+    cfg.ICE_PLANET_COLD = true
+    local basin = pick_basin(ctx, F)
+    if basin then pour(ctx, F, { { basin.seed, basin.capacity * 0.6, 0 } }) end
+    ctx:wait_for(function() return next(s.markers) ~= nil end, 180000)
+    local worst, samples, last = 0, 0, nil
+    ctx:wait_for(function()
+        popup_blocking(ctx)
+        if s.ice_refresh_ms and s.ice_refresh_ms ~= last then
+            last = s.ice_refresh_ms; samples = samples + 1; worst = math.max(worst, s.ice_refresh_ms)
+        end
+        -- Ice spreads plate by plate (realistically slowly on a frozen map): check
+        -- that it forms smoothly rather than wait for every lake.
+        return s.frozen_pools > 0 and ((s.ice_backlog or 1) == 0 or (s.ice_plates or 0) >= 300)
+    end, 300000)
+    ctx:record("ice_formation", { frozen_pools = s.frozen_pools, plates = s.ice_plates, refreshes_seen = samples,
+        worst_refresh_ms = worst, paused = IsPaused(), pause_reasons = pause_reasons(),
+        planet_frozen = F.Ice.PlanetFrozen(), markers = table.count(s.markers) })
+    ctx:assert((s.ice_plates or 0) > 0, "lakes iced over")
+    ctx:record("worst_ice_batch_ms", s.ice_worst_batch_ms)
+    ctx:record("ice_phase_max_ms", s.ice_phase_max_ms)
+    ctx:assert(worst <= 60, "every ice refresh stayed short (at most 60 ms under the debugger)")
+    cfg.ICE_PLANET_COLD = false
+    ctx:wait_for(function() return (s.ice_plates or 0) == 0 and (s.ice_backlog or 1) == 0 end, 300000)
     no_flood_error(ctx, "end")
 end)

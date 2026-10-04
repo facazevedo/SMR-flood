@@ -29,7 +29,7 @@ Flood.Config = {
     MIN_VISIBLE_DEPTH_MM = 10,
     RENDER_LEVEL_STEP_MM = 10,        -- rising level change that redraws a pool
     RENDER_LOWER_STEP_MM = 100,       -- falling: drying is slow and each redraw clears and refills
-    RENDER_BUDGET_MS = 60,            -- real time per redraw spent on native water; the rest waits
+    RENDER_BUDGET_MS = 20,            -- real time per redraw step spent on native water; the rest waits
     MAX_RENDERED_POOLS = 400,         -- largest pools drawn; smaller ones still count in the model
     LARGE_LAKE_PLANES = 2000,         -- lakes this big (native water planes) redraw in coarser steps
     LARGE_LAKE_STEP_MM = 250,         -- level change that redraws a large lake
@@ -43,7 +43,9 @@ Flood.Config = {
 
     -- Gameplay effects. Each ENABLE_* switch is independent.
     DEBUG_EFFECTS = true,             -- per-pass effect summaries; also requires DEBUG_LOGS
-    WET_SNAPSHOT_TICKS = 3,           -- ticks between depth snapshots (effects) and water redraws
+    SNAPSHOT_BUDGET_MS = 6,           -- real time per step keeping the depth snapshot current
+    RESTYLE_BUDGET_MS = 4,            -- real time per step copying water colours to lake planes
+    SNAPSHOT_LEVEL_EPS_MM = 1,        -- level change below which a lake's cells are not rewalked
     EFFECT_INTERVAL_HOURS = 1,        -- cadence of building, soil and groundwater effects
 
     -- 1. Thin, cold air removes standing water fast. EVAPORATION_MM_H is multiplied
@@ -139,6 +141,9 @@ Flood.Config = {
     ICE_THAW_MARGIN = 16,             -- heat above the freeze level before ice thaws
     ICE_TILE_M = 30,                  -- ice plate size
     MAX_ICE_PLATES = 4000,
-    ICE_BUDGET_MS = 30,               -- real time per redraw spent building ice
+    ICE_BUDGET_MS = 8,                -- real time per ice refresh (passability rebuilds included)
+    ICE_BATCH_PLATES = 1,             -- plates per passability rebuild (1: the shortest possible step)
+    ICE_DEPTH_BIN_MM = 50,            -- depth classes for laying ice from the shore inward
+    ICE_RELEVEL_MM = 250,             -- level change before a frozen lake's plates move
     ICE_SUBLIMATION_FACTOR = 0.1,     -- evaporation share while the planet's water is frozen
 }

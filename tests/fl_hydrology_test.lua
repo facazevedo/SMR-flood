@@ -175,4 +175,43 @@ do
     for _, r in ipairs(e2) do assert(by_cell[r[1] .. ':' .. r[2]] == r[3], 'export record differs') end
     count = count + 1
 end
+-- The incremental wet tracker equals WetCells after any pass, sliced or not,
+-- through rain (rising, merging), toxic rain and drying.
+do
+    local w, heights = 48, {}
+    for i = 1, w * w do heights[i] = math.random(0, 30) * 100 + ((i % w) - w / 2) ^ 2 end
+    local m = H.Build(w, w, heights, 16)
+    local tracker = H.NewWetTracker(m)
+    local function compare(label)
+        local wet, conc, cells = H.WetCells(m)
+        for i, d in pairs(wet) do
+            assert(tracker.wet[i] and math.abs(tracker.wet[i] - d) < 1e-6, label .. ': depth differs at ' .. i)
+            assert(math.abs(tracker.concentration[i] - conc[i]) < 1e-9, label .. ': concentration differs at ' .. i)
+        end
+        for i in pairs(tracker.wet) do assert(wet[i], label .. ': stale wet cell ' .. i) end
+        for node, n in pairs(cells) do assert(tracker.pool_cells[node] == n, label .. ': pool cells differ') end
+        for node in pairs(tracker.pool_cells) do assert(cells[node], label .. ': stale pool ' .. node) end
+        count = count + 1
+    end
+    local function full() repeat until H.TrackWet(tracker, 0, function() return false end) end
+    local function sliced()
+        local calls = 0
+        repeat calls = calls + 1 until H.TrackWet(tracker, 0, function() return true end) or calls > 100000
+        return calls
+    end
+    full(); compare('empty')
+    for step = 1, 6 do H.Step(m, 1, 40, false, 0, 0, 0.65); if step % 2 == 0 then full() else assert(sliced() > 1) end end
+    compare('fresh rain')
+    for _ = 1, 4 do H.Step(m, 1, 40, true, 0, 0, 0.65); sliced() end
+    compare('toxic rain')
+    for _ = 1, 30 do H.Step(m, 1, 0, false, 30, 20, 0.65); full() end
+    compare('drying')
+    -- Unchanged pools are skipped: a pass with no change keeps every cached walk.
+    local before = {}
+    for node, entry in pairs(tracker.cache) do before[node] = entry end
+    assert(next(before) ~= nil, 'tracker has pools to keep')
+    repeat until H.TrackWet(tracker, 1, function() return false end)
+    for node, entry in pairs(tracker.cache) do assert(before[node] == entry, 'unchanged pool was walked again') end
+    compare('unchanged pass')
+end
 print('PASS: ' .. count .. ' hydrology assertions')

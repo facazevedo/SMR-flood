@@ -42,36 +42,127 @@ end
 local ICE_COLOR = { 224, 238, 250 }
 local ANIM_PARAMS = { "WaterParam1", "WaterParam2", "WaterParam3", "WaterParam4", "WaterParam6", "WaterParam14" }
 
-local function style(obj, concentration, frozen)
-    if frozen then
-        obj:Setwaterpreset("Water_Default")
-        obj:Setwaterpreset("")
-        obj:SetColorModifier(RGB(ICE_COLOR[1], ICE_COLOR[2], ICE_COLOR[3]))
-        for _, id in ipairs(ANIM_PARAMS) do obj:SetProperty(id, 0) end
-        obj:WaterPropChanged()
-        return
-    end
-    local fresh, toxic = F.Config.FRESH_COLOR, F.Config.TOXIC_COLOR
-    local channels = {}
-    for i = 1, 3 do channels[i] = math.floor(fresh[i] + (toxic[i] - fresh[i]) * concentration + 0.5) end
-    obj:Setwaterpreset("Water_Default")
-    obj:Setwaterpreset("")
-    obj:SetColorModifier(RGB(channels[1], channels[2], channels[3]))
-    -- Calm, shallow water with depth-dependent opacity; toxic water is murkier.
-    obj:SetProperty("WaterParam1", 8)
-    obj:SetProperty("WaterParam6", 35)
-    obj:SetProperty("WaterParam9", math.floor(32 + 45 * concentration))
-    obj:SetProperty("WaterParam10", math.floor(64 + 90 * concentration))
-    obj:SetProperty("WaterParam14", 0)
-    obj:WaterPropChanged()
+-- The water properties a TerrainWaterObject copies to its planes
+-- (water_obj_prop_ids, Water.lua:478-490).
+local WATER_PROP_IDS = { "ColorModifier" }
+for i = 1, 14 do WATER_PROP_IDS[#WATER_PROP_IDS + 1] = "WaterParam" .. i end
+
+-- Restyling: vanilla Setwaterpreset and WaterPropChanged copy every property
+-- to every plane at once (Water.lua:410-433), several thousand planes for a
+-- large lake, which stalls the game. So style() sets the properties on the
+-- marker only (the Water_Default preset values, then Flood's), and the planes
+-- follow from a queue a few milliseconds at a time (W.RestyleStep). Planes
+-- created by later fills copy the marker's properties themselves.
+local restyle_queue, restyle_index = {}, {}
+
+local function queue_planes(obj)
+    local job = restyle_index[obj]
+    if job then job.planes, job.i = obj:GetWaterPlanes(), 1; return end
+    job = { obj = obj, planes = obj:GetWaterPlanes(), i = 1 }
+    restyle_queue[#restyle_queue + 1] = job
+    restyle_index[obj] = job
 end
 
--- Per-cell depth (mm) and toxic concentration for gameplay effects. Computing
--- this walks every cell, so effects read a snapshot refreshed on a cadence.
+local function style(obj, concentration, frozen)
+    local preset = WaterObjPresets.Water_Default
+    for _, id in ipairs(WATER_PROP_IDS) do obj:SetProperty(id, preset:GetProperty(id)) end
+    if not preset:IsColorizationDefault() then obj:SetColorization(preset) end
+    if frozen then
+        obj:SetColorModifier(RGB(ICE_COLOR[1], ICE_COLOR[2], ICE_COLOR[3]))
+        for _, id in ipairs(ANIM_PARAMS) do obj:SetProperty(id, 0) end
+    else
+        local fresh, toxic = F.Config.FRESH_COLOR, F.Config.TOXIC_COLOR
+        local channels = {}
+        for i = 1, 3 do channels[i] = math.floor(fresh[i] + (toxic[i] - fresh[i]) * concentration + 0.5) end
+        obj:SetColorModifier(RGB(channels[1], channels[2], channels[3]))
+        -- Calm, shallow water with depth-dependent opacity; toxic water is murkier.
+        obj:SetProperty("WaterParam1", 8)
+        obj:SetProperty("WaterParam6", 35)
+        obj:SetProperty("WaterParam9", math.floor(32 + 45 * concentration))
+        obj:SetProperty("WaterParam10", math.floor(64 + 90 * concentration))
+        obj:SetProperty("WaterParam14", 0)
+    end
+    queue_planes(obj)
+end
+
+-- Copies queued markers' properties to their planes, as WaterPropChanged does,
+-- for at most budget_ms of real time. Returns true while work remains.
+function W.RestyleStep(budget_ms)
+    local deadline = GetPreciseTicks() + budget_ms
+    while #restyle_queue > 0 do
+        local job = restyle_queue[1]
+        local obj, planes = job.obj, job.planes
+        if IsValid(obj) then
+            while job.i <= #planes do
+                local plane = planes[job.i]
+                job.i = job.i + 1
+                if IsValid(plane) then
+                    for _, id in ipairs(WATER_PROP_IDS) do plane:SetProperty(id, obj:GetProperty(id)) end
+                    plane:SetColorization(obj)
+                end
+                if job.i % 16 == 0 and GetPreciseTicks() >= deadline then return true end
+            end
+        end
+        table.remove(restyle_queue, 1)
+        restyle_index[obj] = nil
+        if GetPreciseTicks() >= deadline then return #restyle_queue > 0 end
+    end
+    return false
+end
+
+function W.RestylePending() return #restyle_queue > 0 end
+
+-- Per-cell depth (mm) and toxic concentration for gameplay effects and drawing.
+-- Walking every wet cell at once stalls the game on a flooded map (about 130 ms
+-- under the debugger), so an incremental tracker (fl_hydrology.lua) keeps
+-- s.wet / s.wet_concentration / s.pool_cells current in place, lake by lake, in
+-- steps of a few milliseconds; lakes whose level moved less than
+-- SNAPSHOT_LEVEL_EPS_MM are skipped. s.pools is the pool list of the last
+-- completed pass. Setting s.wet to false (rebuild, disable) starts afresh.
+local function current_tracker()
+    local s = F.State
+    local t = s.wet_tracker
+    if not t or t.model ~= s.model or s.wet ~= t.wet then
+        t = F.Hydrology.NewWetTracker(s.model)
+        s.wet_tracker = t
+        s.wet, s.wet_concentration, s.pool_cells, s.pools = t.wet, t.concentration, t.pool_cells, false
+    end
+    return t
+end
+
+local function no_model()
+    local s = F.State
+    s.wet, s.wet_concentration, s.pool_cells, s.pools, s.wet_tracker = false, false, false, false, false
+end
+
+-- Advances the snapshot for at most budget_ms of real time, starting a pass if
+-- none is under way. Returns true when a pass completed.
+function W.SnapshotStep(budget_ms)
+    local s = F.State
+    if not s.model then no_model(); return false end
+    local t = current_tracker()
+    local deadline = GetPreciseTicks() + budget_ms
+    local started = GetPreciseTicks()
+    local done = F.Hydrology.TrackWet(t, F.Config.SNAPSHOT_LEVEL_EPS_MM, function() return GetPreciseTicks() >= deadline end)
+    s.snapshot_step_ms = GetPreciseTicks() - started
+    if done then s.pools = t.pools end
+    return done
+end
+
+function W.SnapshotPending()
+    local t = F.State.wet_tracker
+    return t and t.model == F.State.model and t.job ~= false or false
+end
+
+-- A complete, current snapshot right now (tests; not used during play).
 function W.Snapshot()
     local s = F.State
-    if not s.model then s.wet, s.wet_concentration, s.pool_cells, s.pools = false, false, false, false; return end
-    s.wet, s.wet_concentration, s.pool_cells, s.pools = F.Hydrology.WetCells(s.model)
+    if not s.model then no_model(); return end
+    local t = current_tracker()
+    local never = function() return false end
+    if t.job then F.Hydrology.TrackWet(t, 0, never) end
+    F.Hydrology.TrackWet(t, 0, never)
+    s.pools = t.pools
 end
 
 -- Water tint in 5 % steps: restyling touches every plane of a marker, and toxic
@@ -202,7 +293,8 @@ function W.Refresh()
     -- Each rendered pool costs a native fill, so only the largest (by wetted area)
     -- are drawn; the model, and every gameplay effect, still use all of them.
     local candidates = {}
-    for _, pool in ipairs(s.pools or F.Hydrology.Pools(s.model)) do
+    if not s.pools then return end -- no completed snapshot pass yet
+    for _, pool in ipairs(s.pools) do
         if pool.level - s.model.elevations[pool.seed] >= cfg.MIN_VISIBLE_DEPTH_MM then
             candidates[#candidates + 1] = pool
         end

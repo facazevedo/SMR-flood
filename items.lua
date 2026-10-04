@@ -19,6 +19,8 @@ return {
     PlaceObj('ModItemCode', { 'name', "fl_soil", 'CodeFileName', "Code/fl_soil.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_construction", 'CodeFileName', "Code/fl_construction.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_ice", 'CodeFileName', "Code/fl_ice.lua" }),
+    PlaceObj('ModItemCode', { 'name', "fl_terraforming", 'CodeFileName', "Code/fl_terraforming.lua" }),
+    PlaceObj('ModItemCode', { 'name', "fl_cold_wave", 'CodeFileName', "Code/fl_cold_wave.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_ui", 'CodeFileName', "Code/fl_ui.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_lifecycle", 'CodeFileName', "Code/fl_lifecycle.lua" }),
     PlaceObj('ModItemCode', { 'name', "Flood", 'CodeFileName', "Code/Flood.lua" }),

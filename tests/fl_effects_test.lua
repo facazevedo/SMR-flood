@@ -68,6 +68,7 @@ function OnSoilGridChanged() soil_changed = soil_changed + 1 end
 local terraform = { Atmosphere = 0, Temperature = 0 }
 function GetTerraformParamPct(name) return terraform[name] end
 function Sleep() end
+WaterObjPresets = { Water_Default = { GetProperty = function(_, id) return 0 end, IsColorizationDefault = function() return true end } }
 local real_time = 0
 function RealTime() return real_time end
 function GetPreciseTicks() return 0 end
@@ -385,7 +386,9 @@ function DoneObject(o) o.valid = false end
 function PlaceObject()
     local o = { invalidation_box = {} }
     for _, m in ipairs({ "ClearEnumFlags", "SetPos", "UpdateGridAndVisuals", "Setwaterpreset",
-        "SetColorModifier", "SetProperty", "WaterPropChanged" }) do o[m] = function() end end
+        "SetColorModifier", "SetProperty", "WaterPropChanged", "SetColorization" }) do o[m] = function() end end
+    function o:GetProperty() return 0 end
+    function o:GetWaterPlanes() return {} end
     return o
 end
 function MainMap:MapGet() return {} end
@@ -585,21 +588,208 @@ do
     check(F.Ice.FrozenAt(50000, 40000) == true and asked[2][1] == 50000, "ice heat inside the grid is unchanged")
     s.map.heat_grid = nil
     check(F.Ice.FrozenAt(50000, 40000) == false, "no heat grid: not frozen (MaxHeat, as vanilla GetHeatAt)")
-    -- Frost test button: Auto -> On -> Off -> Auto.
-    check(F.Ice.TestFrost() == "auto" and F.Ice.CycleTestFrost() == true and F.Ice.TestFrost() == "on"
-        and F.Ice.FrozenAt(50000, 40000) == true and F.Ice.MapFrozen() == true, "frost on freezes every pool")
-    s.map.heat_grid = heat_grid
-    check(F.Ice.CycleTestFrost() == true and F.Ice.TestFrost() == "off" and F.Ice.FrozenAt(50000, 40000) == false
-        and F.Ice.MapFrozen() == false, "frost off thaws even where it is locally cold")
-    check(F.Ice.CycleTestFrost() == true and F.Ice.TestFrost() == "auto" and F.Ice.FrozenAt(50000, 40000) == true,
-        "frost auto follows the climate again")
-    F.Ice.CycleTestFrost()
-    F.Ice.StopTestFrost()
-    check(F.Ice.TestFrost() == "auto", "stopping test frost clears the override")
-    s.features.ice = false
-    local ok_off, err_off = F.Ice.CycleTestFrost()
-    check(ok_off == false and err_off ~= nil and F.Ice.TestFrost() == "auto", "frost button refused while ice is off")
+    -- Planet ice: the frozen planet freezes every pool, whatever the local heat.
+    s.map.heat_grid = { map_width = 100000, map_height = 80000, GetHeatAtXY = function() return 255 end }
+    F.Config.ICE_PLANET_COLD, WaterFrozen = true, true
+    check(F.Ice.FrozenAt(50000, 40000) == true and F.Ice.MapFrozen() == true, "frozen planet: every pool frozen")
+    WaterFrozen = false
+    check(F.Ice.FrozenAt(50000, 40000) == false and F.Ice.MapFrozen() == false, "liquid water and warm: not frozen")
+    F.Config.ICE_PLANET_COLD, WaterFrozen = false, nil
     s.map, s.features.ice, F.Config.ICE_PLANET_COLD = saved_map, saved_ice, saved_cold
+end
+
+-- Ice batches: a frozen 300 m lake (100 plates of 30 m) forms, moves and melts in
+-- batches of at most ICE_BATCH_PLATES plates per passability rebuild, within
+-- the refresh budget.
+do
+    for name, bit in pairs({ efCollision = 2, efApplyToGrids = 4, efWalkable = 8, efSelectable = 16,
+        efCameraRepulse = 32, efLightShadow = 64, efSunShadow = 128 }) do const[name] = const[name] or bit end
+    local saved_map, saved_markers, saved_ice, saved_get = s.map, s.markers, s.features.ice, terrain.GetHeight
+    local real_place, real_clock = PlaceObject, GetPreciseTicks
+    local clock = 0
+    GetPreciseTicks = function() clock = clock + 1; return clock end
+    -- A bowl: 0 at the centre of the 300 m lake, rising towards its rim (still
+    -- below the 5000 surface), so cells nearer the shore are shallower.
+    local centre = 150 * guim
+    local function bed(x, y)
+        local d = math.sqrt((x - centre) ^ 2 + (y - centre) ^ 2)
+        return math.min(4990, math.floor(4990 * d / (centre * 1.42)))
+    end
+    terrain.GetHeight = function(_, pt) local x, y = pt:xy(); return bed(x, y) end
+    local laid, melted = {}, {}
+    local in_batch, max_batch, batches = 0, 0, 0
+    local s_susp, s_res = MainMap.SuspendPassEdits, MainMap.ResumePassEdits
+    function MainMap:SuspendPassEdits() pass_edits = pass_edits + 1; in_batch = 0 end
+    function MainMap:ResumePassEdits()
+        pass_edits = pass_edits - 1; batches = batches + 1; max_batch = math.max(max_batch, in_batch)
+    end
+    local plates_alive = 0
+    PlaceObject = function(class, ...)
+        if class ~= "FloodIcePlate" then return real_place(class, ...) end
+        local p = { valid = true }
+        for _, m in ipairs({ "ChangeEntity", "SetScale", "SetEnumFlags", "ClearEnumFlags", "SetOpacity", "SetVisible" }) do
+            p[m] = function() end
+        end
+        function p:SetPos(x, y, z)
+            if not self.x then laid[#laid + 1] = self end
+            self.x, self.y, self.z = x, y, z; in_batch = in_batch + 1
+        end
+        function p:GetPos() return point(self.x, self.y) end
+        plates_alive = plates_alive + 1
+        return p
+    end
+    local real_done = DoneObject
+    DoneObject = function(o)
+        if o.z then plates_alive = plates_alive - 1; in_batch = in_batch + 1; melted[#melted + 1] = o end
+        o.valid = false
+    end
+    local lake_z = 5000
+    local lake = { valid = true, zoffset = 0 }
+    for _, m in ipairs({ "Setwaterpreset", "SetColorModifier", "SetProperty", "WaterPropChanged", "SetColorization" }) do
+        lake[m] = function() end
+    end
+    function lake:GetProperty() return 0 end
+    function lake:GetVisualPosXYZ() return 0, 0, lake_z end
+    local plane = { valid = true, SetProperty = function() end, SetColorization = function() end }
+    function plane:GetObjectBBox() return box(0, 0, 300 * guim - 1, 300 * guim - 1) end
+    function lake:GetWaterPlanes() return { plane } end
+    local entry = { obj = lake, x = 1000, y = 1000, expected_m2 = 90000 }
+    s.map, s.markers, s.features.ice = MainMap, { [1] = entry }, true
+    s.ice_melt, s.ice_plates, s.ice_backlog = {}, 0, 0
+    local saved_cold = F.Config.ICE_PLANET_COLD
+    F.Config.ICE_PLANET_COLD, WaterFrozen = true, true
+    F.Ice.Refresh()
+    check(s.ice_backlog > 0 and plates_alive < 100, "ice forms over several refreshes, not at once")
+    check(entry.ice.planes ~= nil and clock <= F.Config.ICE_BUDGET_MS * 3 + 50,
+        "a refresh stops scanning at its budget (the scan resumes later)")
+    local calls = 1
+    while s.ice_backlog > 0 and calls < 1000 do F.Ice.Refresh(); calls = calls + 1 end
+    check(plates_alive == 100 and s.ice_plates == 100 and max_batch <= F.Config.ICE_BATCH_PLATES,
+        "frozen lake fully iced in batches of at most ICE_BATCH_PLATES")
+    -- Shore first overall: the first quarter laid lies further out than the last.
+    local function dist(p) return math.sqrt((p.x - centre) ^ 2 + (p.y - centre) ^ 2) end
+    local function mean(list, i0, i1)
+        local sum = 0
+        for i = i0, i1 do sum = sum + dist(list[i]) end
+        return sum / (i1 - i0 + 1)
+    end
+    check(#laid == 100 and mean(laid, 1, 25) > mean(laid, 76, 100), "ice laid from the shore to the centre")
+    -- Every passability rebuild covers at most ICE_BATCH_PLATES plates.
+    local small_batches = #entry.ice.plate_batches > 0
+    for _, batch in ipairs(entry.ice.plate_batches) do
+        if #batch > F.Config.ICE_BATCH_PLATES then small_batches = false end
+    end
+    check(small_batches, "every ice batch is at most ICE_BATCH_PLATES plates")
+    local z0 = entry.ice.plates[1].z
+    lake_z = lake_z + F.Config.ICE_RELEVEL_MM * guim / 1000 / 2
+    F.Ice.Refresh()
+    check(s.ice_backlog == 0 and entry.ice.plates[1].z == z0, "a small level change keeps the plates in place")
+    lake_z = lake_z + F.Config.ICE_RELEVEL_MM * guim / 1000
+    max_batch, calls = 0, 0
+    repeat F.Ice.Refresh(); calls = calls + 1 until s.ice_backlog == 0 or calls > 1000
+    check(entry.ice.plates[1].z > z0 and entry.ice.plates[100].z == entry.ice.plates[1].z and plates_alive == 100
+        and max_batch <= F.Config.ICE_BATCH_PLATES, "a larger level change moves the plates in batches")
+    WaterFrozen = false
+    max_batch, calls = 0, 0
+    repeat F.Ice.Refresh(); calls = calls + 1 until s.ice_backlog == 0 or calls > 1000
+    check(plates_alive == 0 and s.ice_plates == 0 and not entry.ice and max_batch <= F.Config.ICE_BATCH_PLATES,
+        "thaw melts the plates in batches")
+    check(#melted == 100 and mean(melted, 1, 25) > mean(melted, 76, 100), "ice melts from the shore, the centre last")
+    check(pass_edits == 0, "every ice batch resumed pass edits")
+    F.Config.ICE_PLANET_COLD, WaterFrozen = saved_cold, nil
+    s.map, s.markers, s.features.ice, terrain.GetHeight = saved_map, saved_markers, saved_ice, saved_get
+    PlaceObject, DoneObject, GetPreciseTicks = real_place, real_done, real_clock
+    MainMap.SuspendPassEdits, MainMap.ResumePassEdits = s_susp, s_res
+end
+
+-- Terraformed test button: full terraforming on, exact rollback off.
+do
+    local max_value = 100000
+    Terraforming = { Atmosphere = 12345, Temperature = 2000, Water = 0, Vegetation = 999 }
+    TerraformingParamDefs = { Atmosphere = {}, Temperature = {}, Water = {}, Vegetation = {} }
+    local changes = 0
+    function SetTerraformParam(name, value) Terraforming[name] = value; changes = changes + 1 end
+    function SetTerraformParamPct(name, pct) SetTerraformParam(name, pct * max_value / 100) end
+    local rule = false
+    function IsGameRuleActive(id) return id == "NoTerraforming" and rule end
+    local saved_map = s.map
+    s.map = MainMap
+    MainMap.fl_test_terraform = false
+    check(F.Terraforming.Available() == true and not F.Terraforming.Active(), "terraforming control available, off")
+    check(F.Terraforming.Toggle() == true and F.Terraforming.Active(), "terraformed on")
+    check(Terraforming.Atmosphere == max_value and Terraforming.Temperature == max_value and Terraforming.Water == max_value
+        and Terraforming.Vegetation == max_value, "every parameter at 100 %")
+    check(F.Terraforming.Toggle() == true and not F.Terraforming.Active(), "terraformed off")
+    check(Terraforming.Atmosphere == 12345 and Terraforming.Temperature == 2000 and Terraforming.Water == 0
+        and Terraforming.Vegetation == 999, "initial conditions restored exactly")
+    rule = true
+    local ok, err = F.Terraforming.Toggle()
+    check(ok == false and err and not F.Terraforming.Active(), "refused under the No Terraforming rule")
+    rule = false
+    F.Terraforming.Toggle()
+    F.Terraforming.Restore()
+    F.Terraforming.Restore()
+    check(not F.Terraforming.Active() and Terraforming.Temperature == 2000, "restore is idempotent")
+    s.map = saved_map
+end
+
+-- Cold Wave test button: starts an endless vanilla cold wave, stops only its own.
+do
+    local started, stopped = {}, 0
+    g_ColdWave = false
+    function StartColdWave(settings, endless) g_ColdWave = { settings = settings }; started[#started + 1] = { settings, endless } end
+    function StopColdWave() stopped = stopped + 1; g_ColdWave = false end
+    Presets = Presets or {}
+    Presets.MapSettings = Presets.MapSettings or {}
+    Presets.MapSettings.ColdWave = { ColdWave_VeryLow = { id = "ColdWave_VeryLow" }, ColdWave_High = { id = "ColdWave_High" } }
+    local saved_map = s.map
+    s.map = MainMap
+    MainMap.mapdata = { MapSettings_ColdWave = "ColdWave_High" }
+    MainMap.fl_test_cold_wave = false
+    function MainMap:CreateGameTimeThread(fn, ...) fn(...) end
+    check(F.ColdWave.Available() == true and not F.ColdWave.Active(), "cold wave control available, off")
+    check(F.ColdWave.Toggle() == true and F.ColdWave.Active() and #started == 1 and started[1][2] == true
+        and started[1][1].id == "ColdWave_High", "cold wave on: endless wave with the map's preset")
+    check(F.ColdWave.Toggle() == true and not F.ColdWave.Active() and stopped == 1 and g_ColdWave == false,
+        "cold wave off: vanilla StopColdWave")
+    g_ColdWave = { natural = true }
+    local ok, err = F.ColdWave.Toggle()
+    check(ok == false and err and #started == 1, "a natural cold wave is not replaced")
+    F.ColdWave.Stop()
+    check(stopped == 1 and g_ColdWave.natural, "stopping never ends a natural cold wave")
+    g_ColdWave = false
+    F.ColdWave.Toggle()
+    F.Lifecycle.Disable()
+    check(not F.ColdWave.Active() and stopped == 2, "disabling Flood stops its cold wave")
+    s.map = saved_map
+end
+
+-- Restyling a large lake: the marker changes at once, its planes follow in steps.
+do
+    local real_clock = GetPreciseTicks
+    local clock = 0
+    GetPreciseTicks = function() clock = clock + 1; return clock end
+    local planes = {}
+    for i = 1, 1000 do
+        local plane = { valid = true, props = 0 }
+        function plane:SetProperty() self.props = self.props + 1 end
+        function plane:SetColorization() self.colored = true end
+        planes[i] = plane
+    end
+    local lake = { valid = true, zoffset = 0 }
+    for _, m in ipairs({ "SetColorModifier", "SetProperty", "SetColorization" }) do lake[m] = function() end end
+    function lake:GetProperty() return 0 end
+    function lake:GetWaterPlanes() return planes end
+    local entry = { obj = lake, concentration = 0.5 }
+    F.Water.Restyle(entry)
+    check(F.Water.RestylePending() and not planes[1000].colored, "restyle: marker set, planes queued")
+    F.Water.Restyle(entry) -- restyled again before finishing: one job, restarted
+    local steps = 0
+    while F.Water.RestyleStep(F.Config.RESTYLE_BUDGET_MS) and steps < 10000 do steps = steps + 1 end
+    local all = true
+    for i = 1, 1000 do if not planes[i].colored or planes[i].props ~= 15 then all = false end end
+    check(steps > 5 and all and not F.Water.RestylePending(), "restyle reaches every plane once, in many short steps")
+    GetPreciseTicks = real_clock
 end
 
 print = real_print

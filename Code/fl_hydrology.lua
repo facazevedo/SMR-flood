@@ -487,6 +487,117 @@ function H.WetCells(model, yield_fn)
     return wet, concentration, pool_cells, pools
 end
 
+-- Incremental, resumable WetCells. The tracker keeps wet / concentration /
+-- pool_cells current in place, one pool at a time, so a pass can be spread over
+-- many short steps and readers always see whole pools:
+--   * a pool whose level moved less than eps (mm) and whose concentration is
+--     unchanged since its last update is skipped;
+--   * a changed pool is walked (resumably) and writes its cells as it goes; the
+--     cells it no longer covers are dropped when its walk completes;
+--   * cells of pools that vanished (dried, merged into a larger pool) are dropped
+--     at the end of the pass unless a new pool took them over.
+-- tracker.pools is the pool list of the last completed pass.
+function H.NewWetTracker(model)
+    return { model = model, wet = {}, concentration = {}, pool_cells = {}, pools = false,
+        owner = {}, stamp = {}, cache = {}, pass = 0, job = false, passes = 0 }
+end
+
+local function finish_pool(tracker, job)
+    local walk = job.walk
+    local node, pass = walk.pool.node, tracker.pass
+    local wet, concentration, owner, stamp = tracker.wet, tracker.concentration, tracker.owner, tracker.stamp
+    local old = tracker.cache[node]
+    if old then
+        for _, i in ipairs(old.cells) do
+            if owner[i] == node and stamp[i] ~= pass then wet[i], concentration[i], owner[i] = nil, nil, nil end
+        end
+    end
+    tracker.cache[node] = { level = walk.pool.level, c = walk.pool.concentration, cells = walk.cells }
+    tracker.pool_cells[node] = #walk.cells > 0 and #walk.cells or nil
+    job.walk = false
+end
+
+-- Runs the current pass until done() returns true (checked every few hundred
+-- steps) or the pass completes. Returns true when a pass completed.
+function H.TrackWet(tracker, eps, done)
+    local model = tracker.model
+    local nodes, cells_of, elevations = model.nodes, model.cells_of, model.elevations
+    local wet, concentration, owner, stamp = tracker.wet, tracker.concentration, tracker.owner, tracker.stamp
+    local job = tracker.job
+    if not job then
+        tracker.pass = tracker.pass + 1
+        local stack = {}
+        for _, id in ipairs(model.roots) do stack[#stack + 1] = id end
+        job = { listing = stack, pools = {}, i = 1, walk = false, live = {} }
+        tracker.job = job
+    end
+    local pass, steps = tracker.pass, 0
+    -- List the pools (as H.Pools does), resumably: each needs a level search.
+    local listing = job.listing
+    while listing and #listing > 0 do
+        local n = nodes[remove(listing)]
+        if n.water > 0 then
+            job.pools[#job.pools + 1] = { node = n.id, seed = n.seed, level = H.Level(model, n),
+                volume = n.total, mass = n.total_mass,
+                concentration = n.total > 0 and clamp(div(n.total_mass, n.total), 0, 1) or 0 }
+        else
+            for _, id in ipairs(n.children) do listing[#listing + 1] = id end
+        end
+        steps = steps + 1
+        if steps % 64 == 0 and done() then return false end
+    end
+    job.listing = false
+    while true do
+        local walk = job.walk
+        if not walk then
+            local pool = job.pools[job.i]
+            if not pool then break end
+            job.i = job.i + 1
+            job.live[pool.node] = true
+            local cached = tracker.cache[pool.node]
+            if cached and math.abs(cached.level - pool.level) < eps and cached.c == pool.concentration then
+                -- Unchanged: keep its cells, but mark them as this pass's.
+                for _, i in ipairs(cached.cells) do stamp[i] = pass end
+            else
+                walk = { pool = pool, stack = { pool.node }, cells = {} }
+                job.walk = walk
+            end
+        end
+        if walk then
+            local level, c, node_id = walk.pool.level, walk.pool.concentration, walk.pool.node
+            local stack, cells = walk.stack, walk.cells
+            while #stack > 0 do
+                local n = nodes[remove(stack)]
+                for _, i in ipairs(cells_of[n.id] or no_cells) do
+                    local z = elevations[i]
+                    if level > z then
+                        wet[i], concentration[i], owner[i], stamp[i] = level - z, c, node_id, pass
+                        cells[#cells + 1] = i
+                    end
+                end
+                for _, id in ipairs(n.children) do stack[#stack + 1] = id end
+                steps = steps + 1
+                if steps % 128 == 0 and done() then return false end
+            end
+            finish_pool(tracker, job)
+        end
+        steps = steps + 1
+        if steps % 128 == 0 and done() then return false end
+    end
+    -- Pools gone since the last pass: drop the cells no new pool took over.
+    for node, entry in pairs(tracker.cache) do
+        if not job.live[node] then
+            for _, i in ipairs(entry.cells) do
+                if owner[i] == node then wet[i], concentration[i], owner[i], stamp[i] = nil, nil, nil, nil end
+            end
+            tracker.cache[node], tracker.pool_cells[node] = nil, nil
+        end
+    end
+    tracker.pools, tracker.job = job.pools, false
+    tracker.passes = tracker.passes + 1
+    return true
+end
+
 -- Dissolved tracer left behind by basins that dried completely.
 function H.Residues(model)
     local residues = {}

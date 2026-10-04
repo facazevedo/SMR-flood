@@ -29,7 +29,7 @@ local BOOLEAN_KEYS = { "ENABLE_MOD", "ENABLE_TEST_UI", "DEBUG_LOGS", "DEBUG_HYDR
 
 local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "REBUILD_SLICE_MS", "REBUILD_SLICE_SLEEP_MS", "PAUSED_TICK_MS", "TICK_MS",
     "BACKGROUND_SLICE_MS", "TERRAIN_CHECK_ROWS_PER_TICK", "TERRAIN_BOX_CELLS_PER_TICK", "TERRAIN_SETTLE_MS", "TERRAIN_YIELD_MS",
-    "TEST_RAIN_MULTIPLIER", "WET_SNAPSHOT_TICKS", "EFFECT_INTERVAL_HOURS",
+    "TEST_RAIN_MULTIPLIER", "SNAPSHOT_BUDGET_MS", "RESTYLE_BUDGET_MS", "EFFECT_INTERVAL_HOURS",
     "EVAPORATION_BARREN_MULTIPLIER", "FLOOD_SUSPEND_DEPTH_MM", "FLOOD_RESUME_DEPTH_MM",
     "RECHARGE_RADIUS_M", "RECHARGE_LITRES_PER_UNIT", "RESIDUE_FULL_EFFECT_MM", "RESIDUE_MAX_RADIUS_M",
     "RAIN_REFERENCE_MM_H", "ROVER_SLOW_DEPTH_MM", "ROVER_FORD_DEPTH_MM", "DRONE_SHORT_DEPTH_MM",
@@ -37,7 +37,7 @@ local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "R
     "TRAIN_DEEP_SPEED_PERCENT", "WADING_DEPTH_MM", "DROWNING_DEPTH_MM",
     "MARKER_AREA_SLACK", "MIN_MARKER_AREA_M2", "SUBSAMPLE_M", "MAX_SUBSAMPLES", "RENDER_BUDGET_MS", "MAX_RENDERED_POOLS",
     "LARGE_LAKE_PLANES", "LARGE_LAKE_STEP_MM", "RENDER_LOWER_STEP_MM", "ICE_FREEZE_HEAT",
-    "ICE_TILE_M", "MAX_ICE_PLATES", "ICE_BUDGET_MS" }
+    "ICE_TILE_M", "MAX_ICE_PLATES", "ICE_BUDGET_MS", "ICE_BATCH_PLATES", "ICE_DEPTH_BIN_MM", "ICE_RELEVEL_MM" }
 
 function L.Validate()
     for _, name in ipairs({ "PlaceObject", "DoneObject", "ApplyAllWaterObjects", "AddRects",
@@ -131,36 +131,47 @@ function L.Advance()
     s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
 end
 
--- Draw the water and ice: a fresh snapshot when asked or when none exists,
--- otherwise whatever redraw or ice work the last one left.
-local function draw(snapshot)
+-- Draw the water and ice in short steps. start begins a snapshot pass (every
+-- full tick: the water moved); otherwise only a pass under way continues. A
+-- completed pass redraws the lakes; redraw and ice work left over continue on
+-- later wakes. Before the first completed pass the steps are longer, so water
+-- appears quickly after a load.
+-- check_ice re-checks every lake's frozen state (full and paused ticks): the
+-- conditions can change without the water moving (cold waves, the Terraformed
+-- button while paused).
+local function draw(start, check_ice)
     local s = F.State
-    if snapshot or not s.wet then
-        F.Water.Snapshot()
-        F.Water.Refresh()
-        F.Ice.Refresh()
-    elseif (s.render_backlog or 0) > 0 then
-        -- Keep drawing between snapshots, from the last snapshot's pools.
-        F.Water.Refresh()
-        F.Ice.Refresh()
-    elseif (s.ice_backlog or 0) > 0 then
-        F.Ice.Refresh()
+    local cfg = F.Config
+    if start or not s.wet or F.Water.SnapshotPending() then
+        local budget = (s.pools and s.wet) and cfg.SNAPSHOT_BUDGET_MS or cfg.REBUILD_SLICE_MS
+        if F.Water.SnapshotStep(budget) then
+            F.Water.Refresh()
+            F.Ice.Refresh()
+            return
+        end
     end
+    if (s.render_backlog or 0) > 0 then F.Water.Refresh() end
+    if check_ice or (s.ice_backlog or 0) > 0 then F.Ice.Refresh() end
+    if F.Water.RestylePending() then F.Water.RestyleStep(cfg.RESTYLE_BUDGET_MS) end
+end
+
+-- Work that continues between full ticks (every REBUILD_SLICE_SLEEP_MS).
+local function pending_work()
+    local s = F.State
+    return s.rebuild_job or F.Water.SnapshotPending() or (s.render_backlog or 0) > 0 or (s.ice_backlog or 0) > 0
+        or F.Water.RestylePending()
 end
 
 local function update_effects()
     local s = F.State
     s.ticks = s.ticks + 1
-    -- Rendering follows the snapshot cadence: rebuilding the native water grid
-    -- every tick costs far more than the hydrology itself.
-    draw(s.ticks % F.Config.WET_SNAPSHOT_TICKS == 0)
+    draw(true, true)
     each_effect("Tick")
     local now = GameTime()
     if not s.last_effects then s.last_effects = now; return end
     local elapsed = now - s.last_effects
     if elapsed < F.Config.EFFECT_INTERVAL_HOURS * const.HourDuration then return end
     s.last_effects = now
-    F.Water.Snapshot()
     each_effect("Hourly", elapsed * 1.0 / const.HourDuration, s.last_nominal_rate or 0, s.last_toxic == true)
 end
 
@@ -188,7 +199,11 @@ function L.Tick()
     local sliced = rebuild_slice()
     if not s.model then F.UI.Refresh(); return end -- first build still running
     local now = GameTime()
-    if sliced and s.last_full_tick and now - s.last_full_tick < F.Config.TICK_MS then return end
+    if s.last_full_tick and now - s.last_full_tick < F.Config.TICK_MS then
+        -- Between full ticks: snapshot, redraw and ice work left by the last one.
+        draw(false)
+        return
+    end
     s.last_full_tick = now
     F.Rain.Sync()
     L.Advance()
@@ -219,7 +234,7 @@ function L.PausedTick()
         -- Construction can be placed while paused: keep the terrain current too.
         F.Terrain.Track()
         if F.Terrain.WantsRebuild() then F.Terrain.StartRebuild(s.map) end
-        draw(false)
+        draw(not s.pools, true) -- start the first pass after a load or rebuild; otherwise continue
     end
     F.UI.Refresh()
 end
@@ -251,7 +266,6 @@ function L.Enable()
         s.model, s.grid, s.last_tick, s.last_full_tick = false, false, nil, nil
         s.wet, s.wet_concentration, s.last_effects, s.recharge = false, false, false, {}
         s.map, s.dirty = MainMap, true
-        F.Ice.StopTestFrost()
     end
     s.enabled, s.error = true, false
     L.DetectFeatures()
@@ -260,8 +274,8 @@ function L.Enable()
         Sleep(1) -- let all PostLoadGame handlers finish before creating transient visuals
         while s.enabled do
             if not guarded(L.Tick) then return end
-            -- A rebuild in progress continues after a short timed sleep.
-            Sleep(s.rebuild_job and F.Config.REBUILD_SLICE_SLEEP_MS or F.Config.TICK_MS)
+            -- A rebuild or ice work in progress continues after a short timed sleep.
+            Sleep(pending_work() and F.Config.REBUILD_SLICE_SLEEP_MS or F.Config.TICK_MS)
         end
     end)
     -- Real-time companion: works only while the game is paused (see PausedTick).
@@ -271,7 +285,7 @@ function L.Enable()
         Sleep(F.Config.PAUSED_TICK_MS)
         while s.enabled and s.map == map do
             if IsPaused() and not guarded(L.PausedTick) then return end
-            Sleep(s.rebuild_job and F.Config.REBUILD_SLICE_SLEEP_MS or F.Config.PAUSED_TICK_MS)
+            Sleep(pending_work() and F.Config.REBUILD_SLICE_SLEEP_MS or F.Config.PAUSED_TICK_MS)
         end
     end)
     F.Log("Lifecycle", "enabled", { cell_m = F.Config.CELL_SIZE_M, debug = F.Config.DEBUG_LOGS,
@@ -295,7 +309,8 @@ function L.Disable()
     F.Save.Capture()
     s.enabled = false
     F.Rain.StopOwned()
-    F.Ice.StopTestFrost()
+    F.ColdWave.Stop()
+    F.Terraforming.Restore()
     stop_thread()
     restore_effects("disable")
     F.Water.Clear(s.map)

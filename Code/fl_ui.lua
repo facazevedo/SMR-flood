@@ -1,4 +1,5 @@
--- Temporary test panel: Light / Moderate / Heavy storm toggles, Fresh / Toxic and Frost.
+-- Temporary test panel: Light / Moderate / Heavy storm toggles, Fresh / Toxic, Cold
+-- Wave and Terraformed.
 -- Pattern follows Martian Waters' HUD panel (XDialog parented to GetHUD()).
 local F = Flood
 local UI = {}
@@ -9,7 +10,8 @@ local BUTTON_BG = RGBA(32, 46, 56, 235)
 local BUTTON_ACTIVE = RGBA(40, 130, 110, 245)
 local BUTTON_TOXIC = RGBA(120, 132, 40, 245)
 local BUTTON_HOVER = RGBA(48, 74, 90, 245)
-local BUTTON_FROST = RGBA(70, 118, 168, 245)
+local BUTTON_COLD = RGBA(70, 118, 168, 245)
+local BUTTON_TERRAFORMED = RGBA(64, 140, 72, 245)
 local STRENGTH_NAMES = { "Light", "Moderate", "Heavy" }
 
 local function alive(win)
@@ -58,7 +60,8 @@ local function show()
         button(panel, "idRain" .. strength, function() return F.Rain.Toggle(strength) end)
     end
     button(panel, "idType", function() return F.Rain.ToggleType() end)
-    button(panel, "idFrost", function() return F.Ice.CycleTestFrost() end)
+    button(panel, "idColdWave", function() return F.ColdWave.Toggle() end)
+    button(panel, "idTerraform", function() return F.Terraforming.Toggle() end)
     XText:new({ Id = "idStatus", TextStyle = TEXT_STYLE, Translate = false, Text = "" }, panel)
     if panel.window_state == "new" then panel:Open() end
     F.State.ui = panel
@@ -95,10 +98,12 @@ function UI.Refresh()
     end
     set_button(panel.idType, s.rain_type == "toxic" and "Rain type: Toxic" or "Rain type: Fresh",
         s.rain_type == "toxic" and BUTTON_TOXIC or BUTTON_BG)
-    local frost = F.Ice.TestFrost()
-    local frost_text = frost == "on" and "Frost: On (click: Off)" or frost == "off" and "Frost: Off (click: Auto)"
-        or string.format("Frost: Auto, %s (click: On)", F.Ice.PlanetFrozen() and "planet frozen" or "local cold only")
-    set_button(panel.idFrost, frost_text, frost == "on" and BUTTON_FROST or BUTTON_BG)
+    local cold = F.ColdWave.Active()
+    set_button(panel.idColdWave, cold and "Cold wave: On (click: Off)" or "Cold wave: Off (click: On)",
+        cold and BUTTON_COLD or BUTTON_BG)
+    local terraformed = F.Terraforming.Active()
+    set_button(panel.idTerraform, terraformed and "Terraformed: On (click: Off)" or "Terraformed: Off (click: On)",
+        terraformed and BUTTON_TERRAFORMED or BUTTON_BG)
     if alive(panel.idStatus) then panel.idStatus:SetText(status_lines(s)) end
 end
 
