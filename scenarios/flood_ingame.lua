@@ -379,7 +379,7 @@ HARNESS.scenario("flood_20_effects", function(ctx)
     s.rain_type = "normal"
     local ok, err = F.Rain.Start(3)
     ctx:assert(ok == true, "fresh heavy storm: " .. tostring(err))
-    SetTimeFactor(const.DefaultTimeFactor * 10)
+    SetTimeFactor(const.DefaultTimeFactor * 10) -- faster (30x) measured slower: the game cannot keep up
     wait_effect_passes(ctx, 2)
     ctx:expect_eq(flooded.suspended, "Flooded", "flooded building suspended")
     ctx:assert(flooded:GetUIWarning() ~= nil, "flooded building shows a warning")
@@ -545,7 +545,7 @@ HARNESS.scenario("flood_40_ground_and_people", function(ctx)
     deposit:SetPos(at(F, surface.seed) + point(40 * guim, 0, 0))
     deposit.max_amount = 1000 * const.ResourceScale
     deposit.amount = 100 * const.ResourceScale
-    SetTimeFactor(const.DefaultTimeFactor * 10)
+    SetTimeFactor(const.DefaultTimeFactor * 10) -- faster (30x) measured slower: the game cannot keep up
     wait_effect_passes(ctx, 3)
     ctx:record("deposit_units", { before = 100, after = deposit.amount / const.ResourceScale })
     ctx:assert(deposit.amount > 100 * const.ResourceScale, "fresh seepage recharged the deposit")
@@ -934,18 +934,19 @@ HARNESS.scenario("flood_70_ice", function(ctx)
     ctx:assert(bed_z < water_z - guim / 2, "liquid: walkable surface is the lakebed under the water")
 
     FreezeEntireMap()
-    -- Ice forms within a per-tick budget, largest pools first: wait for every
-    -- frozen pool, then check the test lake.
-    ctx:assert(ctx:wait_for(function() return s.frozen_pools > 0 and s.ice_backlog == 0 end, 300000),
-        "every frozen pool iced over")
-    -- Pools are redrawn and markers retired as levels move: check the nearest
-    -- lake that is drawn now and carries ice, not the marker picked earlier.
-    entry = nil
-    for _, e in pairs(s.markers) do
-        if IsValid(e.obj) and e.x and e.ice and #e.ice.plates > 0 and (not entry or math.abs(e.x - x) + math.abs(e.y - y)
-            < math.abs(entry.x - x) + math.abs(entry.y - y)) then entry = e end
-    end
-    ctx:assert(entry ~= nil, "frozen lake got ice plates")
+    -- Ice spreads plate by plate, the largest lakes first: check the largest drawn
+    -- lake once its ice is complete (the rest of the map keeps icing over).
+    SetTimeFactor(const.DefaultTimeFactor * 10)
+    local covered = ctx:wait_for(function()
+        popup_blocking(ctx)
+        entry = nil
+        for _, e in pairs(s.markers) do
+            if IsValid(e.obj) and e.x and e.frozen and (not entry or (e.expected_m2 or 0) > (entry.expected_m2 or 0)) then entry = e end
+        end
+        return entry and F.Ice.Covered(entry) and #entry.ice.plates > 0
+    end, 300000)
+    SetTimeFactor(const.DefaultTimeFactor)
+    ctx:assert(covered and entry ~= nil, "frozen lake got ice plates")
     if not entry then ctx:fail("no iced lake") end
     ex, ey = entry.x, entry.y
     local plate = entry.ice and entry.ice.plates[1]
@@ -980,8 +981,12 @@ HARNESS.scenario("flood_70_ice", function(ctx)
     if IsValid(colonist) then DoneObject(colonist) end
 
     UnfreezeEntireMap()
-    ctx:assert(ctx:wait_for(function() return not entry.ice and (s.ice_plates or 0) == 0 and (s.ice_backlog or 1) == 0 end,
-        120000), "thaw removed the ice")
+    SetTimeFactor(const.DefaultTimeFactor * 10)
+    ctx:assert(ctx:wait_for(function()
+        popup_blocking(ctx)
+        return not entry.ice and (s.ice_plates or 0) == 0 and (s.ice_backlog or 1) == 0
+    end, 300000), "thaw removed the ice")
+    SetTimeFactor(const.DefaultTimeFactor)
     ctx:record("thawed_marker_still_drawn", IsValid(entry.obj))
     ctx:assert(#MainMap:MapGet("map", "FloodIcePlate") == 0, "no ice plates left on the map")
     local thaw_z = GetWalkableZ(MainMap, ex, ey)

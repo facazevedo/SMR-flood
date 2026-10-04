@@ -185,7 +185,7 @@ Last full run (2026-10-04, game revision 405907, 6 km random map, started from t
 | `flood_40_ground_and_people` | 19/19 | Fresh seepage recharges a deposit; soil raised by fresh, lowered by toxic water and residue |
 | `flood_50_build_drones_trains` | 17/17 | Construction flattening noticed and rebuilt in the background; drone battery drain; train 700 → 105 |
 | `flood_60_train_route` | 12/12 | Real train slower over flooded rail |
-| `flood_70_ice` | 19/19 | Walkable ice at the water level; rover on the ice; thaw restores the lakebed |
+| `flood_70_ice` | 19/19 | Walkable ice at the water level; rover on the ice; thaw restores the lakebed (now checks the largest lake as soon as its ice is complete: 194 s → 22 s) |
 | `flood_80_cold_wave_button` | 15/15 | A vanilla cold wave freezes 400 lakes; ice refreshes at most 18 ms, single plates at most 14 ms; the ice melts after the wave |
 | `flood_85_paused_water` | 10/10 | Read and redrawn while paused; game time unchanged |
 | `flood_90_terrain_edits` | 16/17 | Silent pit found and rebuilt in the background (slices at most 32 ms; 396 of 400 lakes kept their markers) |

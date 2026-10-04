@@ -382,6 +382,11 @@ function I.Refresh()
     end
 end
 
+-- True once a lake's ice is complete (scanned, every cell covered, at its level).
+function I.Covered(entry)
+    return entry.ice ~= nil and complete(entry.ice)
+end
+
 -- A lake's marker is retired or cleared: its ice melts in later batches.
 function I.Remove(entry)
     if not entry.ice then return 0 end
