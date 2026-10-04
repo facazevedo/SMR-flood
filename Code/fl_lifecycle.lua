@@ -31,7 +31,9 @@ local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "T
     "RECHARGE_RADIUS_M", "RECHARGE_LITRES_PER_UNIT", "RESIDUE_FULL_EFFECT_MM", "RESIDUE_MAX_RADIUS_M",
     "RAIN_REFERENCE_MM_H", "ROVER_SLOW_DEPTH_MM", "ROVER_FORD_DEPTH_MM", "DRONE_SHORT_DEPTH_MM",
     "SHUTTLE_GROUND_RAIN_MM_H", "TRAIN_WET_DEPTH_MM", "TRAIN_DEEP_DEPTH_MM", "TRAIN_WET_SPEED_PERCENT",
-    "TRAIN_DEEP_SPEED_PERCENT", "WADING_DEPTH_MM", "DROWNING_DEPTH_MM" }
+    "TRAIN_DEEP_SPEED_PERCENT", "WADING_DEPTH_MM", "DROWNING_DEPTH_MM",
+    "MARKER_AREA_SLACK", "MIN_MARKER_AREA_M2", "SUBSAMPLE_M", "MAX_SUBSAMPLES", "RENDER_BUDGET_MS", "MAX_RENDERED_POOLS",
+    "LARGE_LAKE_PLANES", "LARGE_LAKE_STEP_MM", "RENDER_LOWER_STEP_MM" }
 
 function L.Validate()
     for _, name in ipairs({ "PlaceObject", "DoneObject", "ApplyAllWaterObjects", "AddRects",
@@ -116,7 +118,15 @@ end
 local function update_effects()
     local s = F.State
     s.ticks = s.ticks + 1
-    if not s.wet or s.ticks % F.Config.WET_SNAPSHOT_TICKS == 0 then F.Water.Snapshot() end
+    -- Rendering follows the snapshot cadence: rebuilding the native water grid
+    -- every tick costs far more than the hydrology itself.
+    if not s.wet or s.ticks % F.Config.WET_SNAPSHOT_TICKS == 0 then
+        F.Water.Snapshot()
+        F.Water.Refresh()
+    elseif (s.render_backlog or 0) > 0 then
+        -- Keep drawing between snapshots, from the last snapshot's pools.
+        F.Water.Refresh()
+    end
     each_effect("Tick")
     local now = GameTime()
     if not s.last_effects then s.last_effects = now; return end
@@ -143,7 +153,6 @@ function L.Tick()
             s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
         end
     end
-    F.Water.Refresh()
     update_effects()
     s.status = s.last_rate > 0 and "Rain feeding catchments" or "Dry weather: evaporation and infiltration"
     F.UI.Refresh()
@@ -216,7 +225,7 @@ function L.MapDone(map)
     if s.map ~= map then return end
     F.UI.Hide()
     s.enabled, s.thread, s.map, s.model, s.grid = false, false, false, false, false
-    s.markers, s.rain_thread, s.rain_strength = {}, false, 0
+    s.markers, s.retiring, s.rain_thread, s.rain_strength = {}, {}, false, 0
     s.last_tick, s.next_scan, s.saving, s.building = nil, nil, false, false
     s.wet, s.wet_concentration, s.last_effects, s.recharge = false, false, false, {}
     s.flooded_buildings, s.slowed_rovers = 0, 0

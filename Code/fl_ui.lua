@@ -69,8 +69,8 @@ local function status_lines(s)
     if s.model then
         lines[#lines + 1] = string.format("Rain %.1f mm/h%s, evaporation %.1f mm/h",
             s.last_rate or 0, s.last_toxic and " toxic" or "", s.evaporation_mm_h or 0)
-        lines[#lines + 1] = string.format("Pools %d, water %.0f m3",
-            s.visible_pools or 0, F.Hydrology.Total(s.model) / 1000)
+        lines[#lines + 1] = string.format("Pools %d (%d drawn), water %.0f m3",
+            s.wet_pools or 0, s.visible_pools or 0, F.Hydrology.Total(s.model) / 1000)
         lines[#lines + 1] = string.format("Flooded buildings %d, slowed rovers %d",
             s.flooded_buildings or 0, s.slowed_rovers or 0)
     end

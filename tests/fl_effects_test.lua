@@ -64,6 +64,7 @@ function OnSoilGridChanged() soil_changed = soil_changed + 1 end
 local terraform = { Atmosphere = 0, Temperature = 0 }
 function GetTerraformParamPct(name) return terraform[name] end
 function Sleep() end
+function GetPreciseTicks() return 0 end
 function RGB() return 0 end
 function RGBA() return 0 end
 local real_print = print

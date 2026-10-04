@@ -6,8 +6,12 @@
 -- differently from stock Lua. No external libraries are required.
 local H = {}
 Flood.Hydrology = H
+-- Hot-path globals as locals: inside a mod every global read goes through the
+-- mod environment's __index metamethod.
+local min, max, floor = math.min, math.max, math.floor
+local ipairs, pairs, remove = ipairs, pairs, table.remove
 local function div(a, b) return a * 1.0 / b end
-local function clamp(v, lo, hi) return math.max(lo, math.min(v, hi)) end
+local function clamp(v, lo, hi) return max(lo, min(v, hi)) end
 
 local function neighbours(i, w, h, visit)
     local x = (i - 1) % w
@@ -53,10 +57,10 @@ function H.Build(width, height, elevations, cell_area, yield_fn)
     local function close_node(id, spill)
         local n = nodes[id]
         n.spill = spill
-        n.capacity = math.max(0, (spill * n.count - n.sum) * cell_area)
+        n.capacity = max(0, (spill * n.count - n.sum) * cell_area)
         local children_cap = 0
         for _, c in ipairs(n.children) do children_cap = children_cap + nodes[c].capacity end
-        n.extra_capacity = math.max(0, n.capacity - children_cap)
+        n.extra_capacity = max(0, n.capacity - children_cap)
     end
     for k, i in ipairs(order) do
         local z = elevations[i]
@@ -109,13 +113,24 @@ function H.Build(width, height, elevations, cell_area, yield_fn)
         else nodes[sinks[i]].catchment = nodes[sinks[i]].catchment + 1 end
         if yield_fn and k % 8192 == 0 then yield_fn() end
     end
+    -- Cells whose runoff sink is each node: lets wet-cell queries visit only the
+    -- cells under wet basins instead of the whole grid.
+    local cells_of = {}
+    for i, sink in ipairs(sinks) do
+        if sink ~= 0 then
+            local list = cells_of[sink]
+            if not list then list = {}; cells_of[sink] = list end
+            list[#list + 1] = i
+        end
+    end
+    model.cells_of = cells_of
     return model
 end
 
 local function below(n, level)
     local lo, hi = 0, #n.heights
     while lo < hi do
-        local mid = math.floor(div(lo + hi + 1, 2))
+        local mid = floor(div(lo + hi + 1, 2))
         if n.heights[mid] < level then lo = mid else hi = mid - 1 end
     end
     return lo
@@ -144,37 +159,74 @@ local function totals(model, n)
     end
 end
 
+-- The hierarchy can be over a thousand levels deep on large maps, and the game
+-- engine logs a stack dump for every call past its depth warning. Every subtree
+-- walk below therefore uses an explicit stack, visiting nodes and summing in the
+-- same order as the equivalent recursion.
+
+-- Split a subtree's tracer among its nodes in proportion to their water.
 local function distribute_mass(model, n, mass)
-    if n.total > 0 then
-        n.mass = mass * div(n.water, n.total)
-        for _, id in ipairs(n.children) do
-            local c = model.nodes[id]
-            distribute_mass(model, c, mass * div(c.total, n.total))
+    local nodes = model.nodes
+    local stack_n, stack_m = { n }, { mass }
+    while #stack_n > 0 do
+        local node, m = stack_n[#stack_n], stack_m[#stack_m]
+        stack_n[#stack_n], stack_m[#stack_m] = nil, nil
+        local children = node.children
+        if node.total > 0 then
+            node.mass = m * div(node.water, node.total)
+            for _, id in ipairs(children) do
+                local c = nodes[id]
+                stack_n[#stack_n + 1], stack_m[#stack_m + 1] = c, m * div(c.total, node.total)
+            end
+        else
+            node.mass = #children == 0 and m or 0
+            for k, id in ipairs(children) do
+                stack_n[#stack_n + 1], stack_m[#stack_m + 1] = nodes[id], k == 1 and m or 0
+            end
         end
-    else
-        n.mass = #n.children == 0 and mass or 0
-        for k, id in ipairs(n.children) do distribute_mass(model, model.nodes[id], k == 1 and mass or 0) end
+        node.total_mass = m
     end
-    n.total_mass = mass
 end
 
 -- Store water in a subtree without overflowing it. Return unconsumed input.
+-- Children fill first, in order, while input remains; then the node itself.
 local function fill(model, n, water, mass)
-    for _, id in ipairs(n.children) do
-        if water <= 0 then break end
-        local c = model.nodes[id]
-        if c.total < c.capacity then water, mass = fill(model, c, water, mass) end
+    local nodes = model.nodes
+    local stack = { { n, 1 } }
+    while #stack > 0 do
+        local frame = stack[#stack]
+        local node, k = frame[1], frame[2]
+        local children = node.children
+        local pushed = false
+        while k <= #children and water > 0 do
+            local c = nodes[children[k]]
+            k = k + 1
+            if c.total < c.capacity then
+                frame[2] = k
+                stack[#stack + 1] = { c, 1 }
+                pushed = true
+                break
+            end
+        end
+        if not pushed then
+            local added = min(water, max(0, node.extra_capacity - node.water))
+            local tracer = water > 0 and mass * div(added, water) or 0
+            node.water = node.water + added; node.mass = node.mass + tracer
+            totals(model, node)
+            water, mass = water - added, mass - tracer
+            stack[#stack] = nil
+        end
     end
-    local added = math.min(water, math.max(0, n.extra_capacity - n.water))
-    local tracer = water > 0 and mass * div(added, water) or 0
-    n.water = n.water + added; n.mass = n.mass + tracer
-    totals(model, n)
-    return water - added, mass - tracer
+    return water, mass
 end
 
-function H.Balance(model)
+-- yield_fn, when given, is called every 512 nodes: restoring a large saved water
+-- state balances the whole hierarchy at once (in-game: >30M Lua lines, killed by
+-- the engine's thread watchdog). Yielding never changes the result.
+function H.Balance(model, yield_fn)
     local outflow, tracer_out = 0, 0
-    for _, n in ipairs(model.nodes) do
+    for k, n in ipairs(model.nodes) do
+        if yield_fn and k % 512 == 0 then yield_fn() end
         for _, id in ipairs(n.children) do
             local child = model.nodes[id]
             if n.water > 0 and child.total < child.capacity then
@@ -183,7 +235,7 @@ function H.Balance(model)
         end
         totals(model, n)
         if n.water > 0 then distribute_mass(model, n, n.total_mass) end
-        local excess = math.max(0, n.water - n.extra_capacity)
+        local excess = max(0, n.water - n.extra_capacity)
         if excess > 0 then
             local tracer = n.mass * div(excess, n.water)
             n.water = n.water - excess; n.mass = n.mass - tracer
@@ -200,38 +252,84 @@ function H.Balance(model)
 end
 
 -- Drop a connected water surface by depth mm, splitting at saddles as needed.
+-- Each node lowers its own surface on entry; whatever depth remains passes to
+-- its children; totals are refreshed on exit.
 local function lower(model, n, depth)
-    local initial = n.total
-    if n.water > 0 then
-        local level = H.Level(model, n)
-        local drop = math.min(depth, level - n.base)
-        n.water = math.max(0, extra_at(model, n, level - drop))
-        depth = math.max(0, depth - drop)
+    local nodes = model.nodes
+    local function enter(node, d)
+        local initial = node.total
+        if node.water > 0 then
+            local level = H.Level(model, node)
+            local drop = min(d, level - node.base)
+            node.water = max(0, extra_at(model, node, level - drop))
+            d = max(0, d - drop)
+        end
+        return { node, d, 1, initial }
     end
-    if depth > 0 then
-        for _, id in ipairs(n.children) do lower(model, model.nodes[id], depth) end
+    local stack = { enter(n, depth) }
+    local initial = stack[1][4]
+    while #stack > 0 do
+        local frame = stack[#stack]
+        local node, d, k = frame[1], frame[2], frame[3]
+        if d > 0 and k <= #node.children then
+            frame[3] = k + 1
+            stack[#stack + 1] = enter(nodes[node.children[k]], d)
+        else
+            totals(model, node)
+            stack[#stack] = nil
+        end
     end
-    totals(model, n)
-    return math.max(0, initial - n.total)
+    return max(0, initial - n.total)
 end
 
-local function drain(model, n, depth, infiltration_share)
-    if n.water > 0 or #n.children == 0 then
-        local volume, mass = n.total, n.total_mass
-        local lost = lower(model, n, depth)
-        local removed_mass = volume > 0 and mass * div(lost, volume) * infiltration_share or 0
-        distribute_mass(model, n, math.max(0, mass - removed_mass))
-        if lost > 0 and infiltration_share > 0 then
-            -- Where water entered the ground this step; tracer is the toxic share.
-            model.seepage[#model.seepage + 1] = { seed = n.seed,
-                volume = lost * infiltration_share, mass = removed_mass }
-        end
-        return lost
+-- A wet node or a leaf: lower it and remove infiltrated tracer.
+local function drain_surface(model, n, depth, infiltration_share)
+    local volume, mass = n.total, n.total_mass
+    local lost = lower(model, n, depth)
+    local removed_mass = volume > 0 and mass * div(lost, volume) * infiltration_share or 0
+    distribute_mass(model, n, max(0, mass - removed_mass))
+    if lost > 0 and infiltration_share > 0 then
+        -- Where water entered the ground this step; tracer is the toxic share.
+        model.seepage[#model.seepage + 1] = { seed = n.seed,
+            volume = lost * infiltration_share, mass = removed_mass }
     end
-    local lost = 0
-    for _, id in ipairs(n.children) do lost = lost + drain(model, model.nodes[id], depth, infiltration_share) end
-    totals(model, n)
     return lost
+end
+
+-- Dry interior nodes pass the drain to their children, summing losses in order.
+-- A subtree with no water and no tracer has nothing to drain (Balance has just
+-- refreshed totals), so it is skipped.
+local function drain(model, n, depth, infiltration_share)
+    if n.water > 0 or #n.children == 0 then return drain_surface(model, n, depth, infiltration_share) end
+    local nodes = model.nodes
+    local stack = { { n, 1, 0 } }
+    while true do
+        local frame = stack[#stack]
+        local node, k = frame[1], frame[2]
+        local children = node.children
+        local pushed = false
+        while k <= #children do
+            local c = nodes[children[k]]
+            k = k + 1
+            if c.total > 0 or c.total_mass > 0 then
+                if c.water > 0 or #c.children == 0 then
+                    frame[3] = frame[3] + drain_surface(model, c, depth, infiltration_share)
+                else
+                    frame[2] = k
+                    stack[#stack + 1] = { c, 1, 0 }
+                    pushed = true
+                    break
+                end
+            end
+        end
+        if not pushed then
+            totals(model, node)
+            stack[#stack] = nil
+            if #stack == 0 then return frame[3] end
+            local parent = stack[#stack]
+            parent[3] = parent[3] + frame[3]
+        end
+    end
 end
 
 function H.Step(model, hours, rain_mm_h, toxic, evaporation, infiltration, runoff)
@@ -239,10 +337,10 @@ function H.Step(model, hours, rain_mm_h, toxic, evaporation, infiltration, runof
     assert(runoff >= 0 and runoff <= 1, "invalid runoff coefficient")
     -- Rain falling on standing water is captured fully. Dry land sheds only the
     -- configured runoff fraction; the rest immediately enters the ground.
-    local wet = H.WetCells(model)
     local per_cell = hours * rain_mm_h * model.area
     local input, ground, outlet = 0, 0, 0
     if per_cell > 0 then
+        local wet = H.WetCells(model)
         for i, sink in ipairs(model.sinks) do
             local amount = per_cell * (wet[i] and 1 or runoff)
             input = input + per_cell; ground = ground + per_cell - amount
@@ -262,7 +360,10 @@ function H.Step(model, hours, rain_mm_h, toxic, evaporation, infiltration, runof
     local rate, lost = evaporation + infiltration, 0
     if rate > 0 then
         for _, id in ipairs(model.roots) do
-            lost = lost + drain(model, model.nodes[id], hours * rate, div(infiltration, rate))
+            local root = model.nodes[id]
+            if root.total > 0 or root.total_mass > 0 then
+                lost = lost + drain(model, root, hours * rate, div(infiltration, rate))
+            end
         end
         model.budget.infiltration = model.budget.infiltration + lost * div(infiltration, rate)
         model.budget.evaporation = model.budget.evaporation + lost * div(evaporation, rate)
@@ -282,7 +383,7 @@ function H.Pools(model)
     local pools, stack = {}, {}
     for _, id in ipairs(model.roots) do stack[#stack + 1] = id end
     while #stack > 0 do
-        local n = model.nodes[table.remove(stack)]
+        local n = model.nodes[remove(stack)]
         if n.water > 0 then
             pools[#pools + 1] = { node = n.id, seed = n.seed, level = H.Level(model, n),
                 volume = n.total, mass = n.total_mass,
@@ -292,28 +393,32 @@ function H.Pools(model)
     return pools
 end
 
--- Returns depth (mm) and dissolved tracer concentration (0..1) per wet cell.
+-- Returns depth (mm) and dissolved tracer concentration (0..1) per wet cell, and
+-- the number of wet cells per pool (keyed by the pool's node id).
+-- Also returns the pools list it was computed from.
+-- A cell is covered by a pool when its runoff sink lies in the pool's subtree (a
+-- rising parent lake covers its children's cells) and the level is above it.
+-- Ancestors of a node outside every pool subtree cannot be pool members, so only
+-- the cells under wet subtrees are visited (not the whole grid).
+local no_cells = {}
 function H.WetCells(model)
-    local wet, concentration, levels, pool_of = {}, {}, {}, {}
-    for _, pool in ipairs(H.Pools(model)) do
+    local wet, concentration, pool_cells = {}, {}, {}
+    local pools = H.Pools(model)
+    local nodes, cells_of, elevations = model.nodes, model.cells_of, model.elevations
+    for _, pool in ipairs(pools) do
+        local level, c, count = pool.level, pool.concentration, 0
         local stack = { pool.node }
         while #stack > 0 do
-            local n = model.nodes[table.remove(stack)]
-            levels[n.id] = pool.level; pool_of[n.id] = pool
+            local n = nodes[remove(stack)]
+            for _, i in ipairs(cells_of[n.id] or no_cells) do
+                local z = elevations[i]
+                if level > z then wet[i] = level - z; concentration[i] = c; count = count + 1 end
+            end
             for _, id in ipairs(n.children) do stack[#stack + 1] = id end
         end
+        if count > 0 then pool_cells[pool.node] = count end
     end
-    -- A cell's own terrain component (rather than its runoff sink) determines
-    -- whether a rising parent lake covers it. Sink ancestors carry that level.
-    for i, sink in ipairs(model.sinks) do
-        local id, level = sink, levels[sink]
-        while id ~= 0 and level == nil do id = model.nodes[id].parent; level = levels[id] end
-        if level and level > model.elevations[i] then
-            wet[i] = level - model.elevations[i]
-            concentration[i] = pool_of[id].concentration
-        end
-    end
-    return wet, concentration
+    return wet, concentration, pool_cells, pools
 end
 
 -- Dissolved tracer left behind by basins that dried completely.
@@ -335,7 +440,7 @@ function H.Export(model)
     for _, pool in ipairs(H.Pools(model)) do
         local stack = { pool.node }
         while #stack > 0 do
-            local n = model.nodes[table.remove(stack)]
+            local n = model.nodes[remove(stack)]
             concentration[n.id] = div(pool.mass, pool.volume)
             for _, id in ipairs(n.children) do stack[#stack + 1] = id end
         end
@@ -352,7 +457,7 @@ function H.Export(model)
     return records
 end
 
-function H.Import(model, records)
+function H.Import(model, records, yield_fn)
     for _, rec in ipairs(records) do
         local sink = model.sinks[rec[1]]
         assert(sink ~= nil and rec[2] >= 0 and rec[3] >= 0, "invalid saved water cell")
@@ -362,5 +467,5 @@ function H.Import(model, records)
             n.water = n.water + rec[2]; n.mass = n.mass + rec[3]
         end
     end
-    H.Balance(model)
+    H.Balance(model, yield_fn)
 end

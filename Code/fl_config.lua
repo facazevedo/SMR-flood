@@ -9,7 +9,9 @@ Flood.Config = {
     CELL_SIZE_M = 4,
     MAX_GRID_CELLS = 262144,
     SAMPLE_YIELD_ROWS = 8,
-    TICK_MS = 1000,
+    SUBSAMPLE_M = 4,                  -- spacing of the sub-samples whose minimum is a cell's height
+    MAX_SUBSAMPLES = 4,               -- per axis (so up to 16 height reads per cell)
+    TICK_MS = 3000,                   -- game ms between simulation steps (1/10 game hour)
     TERRAIN_RESCAN_HOURS = 6,
     RAIN_MM_H = { 5, 15, 40 },
     EVAPORATION_MM_H = 0.4,
@@ -18,7 +20,14 @@ Flood.Config = {
     TEST_STRENGTH = 3,
     TEST_RAIN_MULTIPLIER = 10,
     MIN_VISIBLE_DEPTH_MM = 10,
-    RENDER_LEVEL_STEP_MM = 10,
+    RENDER_LEVEL_STEP_MM = 10,        -- rising level change that redraws a pool
+    RENDER_LOWER_STEP_MM = 100,       -- falling: drying is slow and each redraw clears and refills
+    RENDER_BUDGET_MS = 60,            -- real time per redraw spent on native water; the rest waits
+    MAX_RENDERED_POOLS = 400,         -- largest pools drawn; smaller ones still count in the model
+    LARGE_LAKE_PLANES = 2000,         -- lakes this big (native water planes) redraw in coarser steps
+    LARGE_LAKE_STEP_MM = 250,         -- level change that redraws a large lake
+    MARKER_AREA_SLACK = 3,            -- rendered area may exceed the model's wetted area by this factor
+    MIN_MARKER_AREA_M2 = 2000,        -- before the engine lowers a surface to stop it spilling
     FRESH_COLOR = { 90, 151, 170 },
     TOXIC_COLOR = { 161, 181, 59 },
     UI_LEFT = 24,
@@ -26,7 +35,7 @@ Flood.Config = {
 
     -- Gameplay effects. Each ENABLE_* switch is independent.
     DEBUG_EFFECTS = true,             -- per-pass effect summaries; also requires DEBUG_LOGS
-    WET_SNAPSHOT_TICKS = 10,          -- ticks between per-cell depth snapshots used by effects
+    WET_SNAPSHOT_TICKS = 3,           -- ticks between depth snapshots (effects) and water redraws
     EFFECT_INTERVAL_HOURS = 1,        -- cadence of building, soil and groundwater effects
 
     -- 1. Thin, cold air removes standing water fast. EVAPORATION_MM_H is multiplied

@@ -11,12 +11,14 @@ function F.Save.Capture()
     return saved
 end
 
-function F.Save.Import(model, grid, saved)
+-- yield_fn (optional) keeps a large restore under the engine's thread watchdog.
+function F.Save.Import(model, grid, saved, yield_fn)
     assert(type(saved) == "table" and saved.schema == 1, "unsupported Flood save schema")
     assert(saved.sx == grid.sx and saved.sy == grid.sy, "Flood saved map dimensions do not match")
     assert(type(saved.cells) == "table" and saved.width >= 3 and saved.height >= 3, "invalid Flood saved grid")
     local records = {}
-    for _, record in ipairs(saved.cells) do
+    for k, record in ipairs(saved.cells) do
+        if yield_fn and k % 4096 == 0 then yield_fn() end
         local i = record[1]
         assert(type(i) == "number" and i >= 1 and i <= saved.width * saved.height, "invalid Flood saved cell")
         local x = (i - 1) % saved.width
@@ -25,7 +27,7 @@ function F.Save.Import(model, grid, saved)
         local ny = math.min(grid.height - 1, math.floor((y + 0.5) * grid.height / (saved.height * 1.0)))
         records[#records + 1] = { ny * grid.width + nx + 1, record[2], record[3] }
     end
-    F.Hydrology.Import(model, records)
+    F.Hydrology.Import(model, records, yield_fn)
     F.Log("Save", "restored water and dissolved residue", { cells = #records })
 end
 

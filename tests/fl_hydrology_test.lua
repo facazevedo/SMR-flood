@@ -99,4 +99,45 @@ for case = 1, 100 do
     near(rv, v, 'random terrain saved volume')
     near(rm, mass, 'random terrain saved mass')
 end
+-- WetCells must match the original per-cell ancestor walk exactly.
+local function reference_wet(model)
+    local wet, levels = {}, {}
+    for _, pool in ipairs(H.Pools(model)) do
+        local stack = { pool.node }
+        while #stack > 0 do
+            local n = model.nodes[table.remove(stack)]
+            levels[n.id] = pool.level
+            for _, id in ipairs(n.children) do stack[#stack + 1] = id end
+        end
+    end
+    for i, sink in ipairs(model.sinks) do
+        local id, level = sink, levels[sink]
+        while id ~= 0 and level == nil do id = model.nodes[id].parent; level = levels[id] end
+        if level and level > model.elevations[i] then wet[i] = level - model.elevations[i] end
+    end
+    return wet
+end
+math.randomseed(7)
+for case = 1, 30 do
+    local heights = {}
+    for i = 1, 400 do heights[i] = math.random(0, 12) * 100 end
+    m = H.Build(20, 20, heights, 16)
+    H.Step(m, 1, case % 3 == 0 and 0 or 300, case % 2 == 0, 0.5, 1.5, 0.65)
+    local expected, actual = reference_wet(m), H.WetCells(m)
+    for i = 1, 400 do near(actual[i] or 0, expected[i] or 0, 'WetCells matches reference walk') end
+end
+
+-- Large dry map: the game's thread watchdog killed an O(cells x depth) walk on
+-- a 384 x 384 grid (5 s). The memoized resolution must stay well under that.
+do
+    local w, heights = 384, {}
+    for i = 1, w * w do heights[i] = math.random(0, 400) * 10 end
+    local big = H.Build(w, w, heights, 256)
+    local t0 = os.clock()
+    H.WetCells(big)
+    H.Step(big, 1 / 30, 0, false, 10, 1.5, 0.65)
+    local seconds = os.clock() - t0
+    assert(seconds < 1, 'dry WetCells + Step on 384x384 too slow: ' .. seconds .. ' s')
+    count = count + 1
+end
 print('PASS: ' .. count .. ' hydrology assertions')

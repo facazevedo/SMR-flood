@@ -49,8 +49,14 @@ Edit `Code/fl_config.lua`, redeploy, then restart the game. `metadata.lua` is th
 | `RUNOFF_COEFFICIENT` | 0.65 | Fraction of rain on dry ground reaching low ground |
 | `CELL_SIZE_M` | 4 | Requested terrain sampling spacing |
 | `MAX_GRID_CELLS` | 262144 | Larger maps explicitly use a coarser grid, shown in the panel/log |
+| `SUBSAMPLE_M`, `MAX_SUBSAMPLES` | 4, 4 | Each cell takes the lowest of up to 4 x 4 height reads, so narrow notches in basin rims are not missed |
+| `TICK_MS` | 3000 | Game time between simulation steps (1/10 game hour) |
 | `EFFECT_INTERVAL_HOURS` | 1 | Cadence of building, dust, soil, groundwater, breakdown and colonist effects |
-| `WET_SNAPSHOT_TICKS` | 10 | Ticks between per-cell depth snapshots used by effects |
+| `WET_SNAPSHOT_TICKS` | 3 | Ticks between per-cell depth snapshots (effects) and water redraws |
+| `MAX_RENDERED_POOLS` | 400 | Largest pools drawn as native water; smaller ones still count in the model and effects |
+| `RENDER_BUDGET_MS` | 60 | Real time per redraw spent rebuilding native water; the rest follows on later redraws |
+| `MARKER_AREA_SLACK`, `MIN_MARKER_AREA_M2` | 3, 2000 | Bound on each drawn lake's area before the engine lowers it to stop a spill |
+| `LARGE_LAKE_PLANES`, `LARGE_LAKE_STEP_MM` | 2000, 100 | Lakes with this many native water planes redraw every 100 mm of level change; small pools beside them defer their clean-up to the large lake's redraw |
 | `DEBUG_LOGS` | `true` | Lifecycle, API failures, terrain, save and rain diagnostics |
 | `DEBUG_HYDROLOGY` | `false` | Per-tick water-budget diagnostics; also requires `DEBUG_LOGS == true` |
 | `DEBUG_EFFECTS` | `true` | Per-pass effect summaries; also requires `DEBUG_LOGS == true` |
@@ -74,6 +80,24 @@ The simulation thread is stopped before every save and restarted afterwards, so 
 This is a catchment storage model for the game's terraforming setting, not an atmospheric Mars climate simulation. Its fill/spill/merge design follows the depression-hierarchy principle described by [Barnes, Callaghan and Wickert (2021)](https://esurf.copernicus.org/articles/9/105/2021/); the implementation here is original Lua. The game exposes storm strength, not measured precipitation, so configurable rates supply that missing physical quantity.
 
 Catchment runoff routes within each simulation tick. Infiltration is a configurable effective rate. Evaporation scales with terraforming but is not a temperature- or pressure-resolved model. Holes smaller than the sampling grid may be missed; "every hole" cannot be guaranteed below that resolution. Surface shape is rendered by the native water grid and may differ near a shoreline from the sampled volume model. Terrain is never carved or modified by Flood. Landscaping triggers a rebuild, and periodic scans detect other terrain edits while redistributing saved volume. Simulation and drying pause with game time. Underground and asteroid maps do not receive rain.
+
+### Rendering and performance
+
+Each drawn pool is one native `TerrainWaterObject` that the engine flood-fills from the pool's lowest point. Native fills dominate the cost, so:
+
+- **Drawn pools:** only the `MAX_RENDERED_POOLS` largest are drawn.
+- **Redraw budget:** each redraw spends at most `RENDER_BUDGET_MS` on native work, largest level changes first.
+- **Marker reuse:** markers move with their water when basins merge or split.
+- **Rising water:** only fills; it never clears and refills.
+- **Narrow rebuild:** a lowered or dried surface clears only its own box and refills the water objects touching it. It doesn't use `ApplyAllWaterObjects`, whose box grows over every intersecting object; that made one cleared lake refill nearly the whole map, taking 2.4 s.
+- **Large lakes:** a lake of thousands of planes takes about 0.8 s to refill, so it redraws only every 100 mm, and small pools beside it leave their clean-up to its next redraw.
+- **Spill bound:** each drawn lake's area is bounded, so a level that overshoots a rim notch narrower than the sampling is lowered by the engine instead of flooding the map.
+
+All figures below were measured under the harness's debugger on a 6 km map with 147,456 cells. Retail runs without the debugger hook are faster.
+
+- **Simulation step:** about 35 ms.
+- **Snapshot:** about 130 ms.
+- **Redraw:** about 70 ms on average and about 110 ms at worst on a map flooded by several metres of test rain.
 
 The game has no local vegetation-growth control. Plants respond to the soil grid, which is how vanilla toxic pools and Landscaping lakes act locally, so Flood's vegetation effects go through soil quality. Effects are sampled at object centers and build footprints at hex resolution.
 
@@ -110,7 +134,29 @@ Run `python -B tools/fl_validate.py` for syntax, manifest order and the offline 
 
 Run `python -B tools/fl_deploy.py` to validate and copy only `metadata.lua`, `items.lua` and `Code/*.lua` to `%APPDATA%\Surviving Mars Relaunched\Mods\flood`. The destination must identify itself as Flood; extra files stop deployment. Copy hashes are checked and nothing is deleted.
 
-The source folder is this project root. Lua 5.4 `lua` and `luac` are used for local checks. The stub tests catch logic and wiring errors but are not the game; in-game behavior needs the checks below.
+The source folder is this project root. Lua 5.4 `lua` and `luac` are used for local checks. The stub tests catch logic and wiring errors but are not the game.
+
+### In-game tests
+
+`scenarios/flood_ingame.lua` runs inside a live hidden game through `D:\PROJS\SMR\smr-harness` (`smr.cmd`):
+
+- `flood_00_new_game`: starts a fresh colony map and checks the scan and that every effect is available.
+- `flood_20_effects`: floods a basin and checks every building, vehicle, colonist, dust and shuttle effect, then disable/enable.
+- `flood_10_rain`: runs real Heavy fresh and toxic storms and checks storage, spill bounds, contamination, the panel and that the redraw catches up.
+- `flood_30_save_load`: saves the flooded colony (the simulation stops and restarts around the save), loads it, checks the water volume is restored, then deletes the test save.
+
+Last full run (2026-10-04, game revision 405907, 6 km random map): all 78 checks passed.
+
+| Scenario | Checks |
+|---|---|
+| `flood_00_new_game` | 18/18 |
+| `flood_20_effects` | 32/32 |
+| `flood_10_rain` | 16/16 |
+| `flood_30_save_load` | 12/12 |
+
+The save/load run restored 100,187,559 m³ of 100,190,287 m³.
+
+Run them after `smr daemon start --hidden`. Enable Flood for the session (`TurnModOn("Flood")`, then `smr reload --full`), then run `smr test <scenario> --project <this folder> --screenshot`. Reports and screenshots go to `.harness/`.
 
 Game logs are in `%APPDATA%\Surviving Mars Relaunched\logs`. Search for `[Flood:` and Lua errors. Logs are retained; no automatic deletion workflow is configured.
 
