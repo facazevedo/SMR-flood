@@ -63,7 +63,10 @@ local function update_rovers(hours)
     local slowed = 0
     for _, rover in ipairs(labels("Rover")) do
         if ground_rover(rover) then
-            local depth, concentration = F.Water.DepthAt(rover:GetPos():xy())
+            local x, y = rover:GetPos():xy()
+            local depth, concentration = F.Water.DepthAt(x, y)
+            -- On ice the rover drives on the frozen surface, not through water.
+            if depth > 0 and F.Ice.FrozenAt(x, y) then depth = 0 end
             if slow_on and not IsKindOf(rover, "RCHarvester") then
                 local deep = depth >= cfg.ROVER_SLOW_DEPTH_MM
                 rover:SetModifier("move_speed", ROVER_MODIFIER, 0, deep and -cfg.ROVER_SLOW_PERCENT or 0)
@@ -99,7 +102,8 @@ local function update_drones(hours, rain_mm_h)
     for _, drone in ipairs(labels("Drone")) do
         if IsValid(drone) and IsKindOf(drone, "Drone") and not IsKindOf(drone, "FlyingDrone")
             and not drone:IsDead() and not drone:GetParent() and drone:IsValidPos() then
-            if F.Water.DepthAt(drone:GetPos():xy()) >= cfg.DRONE_SHORT_DEPTH_MM then
+            local x, y = drone:GetPos():xy()
+            if F.Water.DepthAt(x, y) >= cfg.DRONE_SHORT_DEPTH_MM and not F.Ice.FrozenAt(x, y) then
                 local drain = math.floor(drone.battery_max * cfg.DRONE_WATER_BATTERY_PER_HOUR * hours)
                 if drain > 0 then drone:UseBattery(drain) end
             end

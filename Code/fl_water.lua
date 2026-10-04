@@ -38,7 +38,19 @@ local function rebuild_box(map, box)
         refilled = refilled, box_m = math.floor(box:sizex() / guim) .. "x" .. math.floor(box:sizey() / guim) }
 end
 
-local function style(obj, concentration)
+-- Frozen water: a pale ice tint and no flow animation (as Martian Waters' Freeze).
+local ICE_COLOR = { 224, 238, 250 }
+local ANIM_PARAMS = { "WaterParam1", "WaterParam2", "WaterParam3", "WaterParam4", "WaterParam6", "WaterParam14" }
+
+local function style(obj, concentration, frozen)
+    if frozen then
+        obj:Setwaterpreset("Water_Default")
+        obj:Setwaterpreset("")
+        obj:SetColorModifier(RGB(ICE_COLOR[1], ICE_COLOR[2], ICE_COLOR[3]))
+        for _, id in ipairs(ANIM_PARAMS) do obj:SetProperty(id, 0) end
+        obj:WaterPropChanged()
+        return
+    end
     local fresh, toxic = F.Config.FRESH_COLOR, F.Config.TOXIC_COLOR
     local channels = {}
     for i = 1, 3 do channels[i] = math.floor(fresh[i] + (toxic[i] - fresh[i]) * concentration + 0.5) end
@@ -68,6 +80,14 @@ local function tint_of(concentration)
     return math.floor(concentration * 20 + 0.5) * 5
 end
 
+-- Re-applies a drawn pool's look after it freezes or thaws.
+function W.Restyle(entry)
+    if not IsValid(entry.obj) then return end
+    local tint = entry.frozen and -1 or tint_of(entry.concentration or 0)
+    style(entry.obj, tint >= 0 and tint / 100.0 or 0, entry.frozen)
+    entry.tint = tint
+end
+
 function W.DepthAt(x, y)
     local s = F.State
     if not s.wet or not s.grid then return 0, 0 end
@@ -93,6 +113,7 @@ function W.FootprintDepth(pos, angle, shape)
 end
 
 function W.Clear(map)
+    if F.Ice then F.Ice.ClearAll() end
     local dirty
     if map and map:IsValid() then
         for _, obj in ipairs(map:MapGet("map", "FloodWaterMarker")) do
@@ -219,7 +240,10 @@ function W.Refresh()
                 if up ~= 0 and IsValid(stale[up].obj) then s.markers[id] = stale[up]; stale[up] = nil end
             end
         end
-        for _, entry in pairs(stale) do s.retiring[#s.retiring + 1] = entry.obj end
+        for _, entry in pairs(stale) do
+            if F.Ice then F.Ice.Remove(entry) end
+            s.retiring[#s.retiring + 1] = entry.obj
+        end
     end
     -- Work list: retire dry markers first, then the largest level changes.
     local work = {}
@@ -233,8 +257,9 @@ function W.Refresh()
         if change >= needed then work[#work + 1] = { id = id, pool = pool, x = x, y = y, z = z, change = change } end
         if entry then
             entry.expected_m2 = (s.pool_cells and s.pool_cells[id] or 0) * s.model.area
-            local tint = tint_of(pool.concentration)
-            if entry.tint ~= tint then style(entry.obj, tint / 100.0); entry.tint = tint end
+            entry.concentration = pool.concentration
+            local tint = entry.frozen and -1 or tint_of(pool.concentration)
+            if entry.tint ~= tint then style(entry.obj, tint / 100.0, entry.frozen); entry.tint = tint end
         end
     end
     table.sort(work, function(a, b) return a.change > b.change end)
@@ -267,8 +292,9 @@ function W.Refresh()
         entry.expected_m2 = (s.pool_cells and s.pool_cells[item.id] or 0) * s.model.area
         local t0 = GetPreciseTicks()
         measure(place(entry, item.x, item.y, item.z), t0)
-        local tint = tint_of(item.pool.concentration)
-        if entry.tint ~= tint then style(entry.obj, tint / 100.0); entry.tint = tint end
+        entry.concentration = item.pool.concentration
+        local tint = entry.frozen and -1 or tint_of(item.pool.concentration)
+        if entry.tint ~= tint then style(entry.obj, tint / 100.0, entry.frozen); entry.tint = tint end
         done = done + 1
     end
     s.visible_pools = visible

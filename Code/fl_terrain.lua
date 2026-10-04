@@ -2,6 +2,21 @@ local F = Flood
 local T = {}
 F.Terrain = T
 
+-- A rebuild (sampling, the depression hierarchy, restoring saved water) costs
+-- about 30M Lua lines on a 6 km map. The engine's infinite-loop watchdog stops a
+-- thread at about 30M lines, and in-game it counted straight through the
+-- rebuild's Sleep(0) yields ("sleeps 65" and "sleeps 78" in its reports). So a
+-- rebuild runs as a coroutine job resumed for at most REBUILD_SLICE_MS of real
+-- time per simulation tick. Each slice's tick then ends with a timed game-time
+-- Sleep (REBUILD_SLICE_SLEEP_MS), the same kind of wait that ends every tick.
+local job_co = false
+
+-- Yield point inside the heavy loops: suspends the rebuild job, and does nothing
+-- when called outside it.
+function T.Yield()
+    if job_co and coroutine.running() == job_co then coroutine.yield() end
+end
+
 function T.Sample(map)
     local sx, sy = terrain.GetMapSize(map)
     local step = math.max(F.Config.CELL_SIZE_M * guim, const.HeightTileSize)
@@ -35,7 +50,7 @@ function T.Sample(map)
             local k = #heights + 1
             heights[k], low_x[k], low_y[k] = best * 1000.0 / guim, bx, by
         end
-        if y % F.Config.SAMPLE_YIELD_ROWS == 0 then Sleep(0) end
+        if y % F.Config.SAMPLE_YIELD_ROWS == 0 then T.Yield() end
     end
     return { width = w, height = h, sx = sx, sy = sy, dx = dx, dy = dy, subsamples = n,
         elevations = heights, low_x = low_x, low_y = low_y, area = dx * dy / (guim * guim * 1.0) }
@@ -61,10 +76,10 @@ function T.Cell(grid, x, y)
     return cy * grid.width + cx + 1
 end
 
-function T.Rebuild(map)
+-- The job body: pure Lua plus terrain reads (no engine waits, so it can run as
+-- a coroutine). Returns nothing when the terrain is unchanged.
+local function compute(map)
     local s = F.State
-    s.building = true
-    s.status = "Scanning terrain..."
     local grid = T.Sample(map)
     local old = s.grid
     local changed = not old or old.width ~= grid.width or old.height ~= grid.height
@@ -73,15 +88,59 @@ function T.Rebuild(map)
             if old.elevations[i] ~= z then changed = true; break end
         end
     end
-    if not changed then s.building = false; s.dirty = false; return end
+    if not changed then return end
     local records = s.model and F.Save.Capture() or map.fl_saved
-    local function yield() Sleep(0) end
-    local model = F.Hydrology.Build(grid.width, grid.height, grid.elevations, grid.area, yield)
-    if records then F.Save.Import(model, grid, records, yield) end
-    F.Water.Clear(map)
-    s.grid, s.model, s.dirty, s.building = grid, model, false, false
-    F.Log("Terrain", "depression hierarchy rebuilt", { cells = grid.width * grid.height,
-        basins = #model.nodes, cell_width_m = grid.dx * 1.0 / guim,
-        cell_height_m = grid.dy * 1.0 / guim, restored = records ~= false and records ~= nil })
+    local model = F.Hydrology.Build(grid.width, grid.height, grid.elevations, grid.area, T.Yield)
+    if records then F.Save.Import(model, grid, records, T.Yield) end
+    return grid, model, records ~= false and records ~= nil
 end
 
+-- Starts a rebuild job; the old model stays in use (frozen) until it finishes.
+function T.StartRebuild(map)
+    local s = F.State
+    s.building = true
+    s.status = "Scanning terrain..."
+    s.rebuild_job = { co = coroutine.create(compute), map = map, slices = 0, started = GameTime() }
+end
+
+-- Resumes the job for one slice. Returns true once it has finished and its
+-- result is installed. A failure cancels the job and raises its error.
+function T.StepRebuild()
+    local s = F.State
+    local job = s.rebuild_job
+    local started = GetPreciseTicks()
+    job.slices = job.slices + 1
+    repeat
+        job_co = job.co
+        local ok, grid, model, restored = coroutine.resume(job.co, job.map)
+        job_co = false
+        if not ok then
+            T.CancelRebuild()
+            error("terrain rebuild failed: " .. tostring(grid), 0)
+        end
+        if coroutine.status(job.co) == "dead" then
+            s.rebuild_job, s.building, s.dirty = false, false, false
+            if grid then
+                F.Water.Clear(job.map)
+                s.grid, s.model = grid, model
+                F.Log("Terrain", "depression hierarchy rebuilt", { cells = grid.width * grid.height,
+                    basins = #model.nodes, cell_width_m = grid.dx * 1.0 / guim,
+                    cell_height_m = grid.dy * 1.0 / guim, restored = restored, slices = job.slices })
+            end
+            return true
+        end
+    until GetPreciseTicks() - started >= F.Config.REBUILD_SLICE_MS
+    return false
+end
+
+-- Drops an unfinished job (save, disable, map change, error); the terrain is
+-- scanned again later. Idempotent.
+function T.CancelRebuild()
+    local s = F.State
+    if s.rebuild_job then
+        F.Log("Terrain", "rebuild cancelled", { slices = s.rebuild_job.slices })
+        s.dirty = true
+    end
+    s.rebuild_job, s.building = false, false
+    job_co = false
+end

@@ -52,7 +52,10 @@ function P.Tick()
     local city = s.map and s.map.City
     for _, c in ipairs(city and city.labels.Colonist or {}) do
         if exposed(c) then
-            local depth, concentration = F.Water.DepthAt(c:GetPos():xy())
+            local x, y = c:GetPos():xy()
+            local depth, concentration = F.Water.DepthAt(x, y)
+            -- On ice a colonist walks on the frozen surface: no wading or contact.
+            if depth > 0 and F.Ice.FrozenAt(x, y) then depth = 0 end
             if raining or depth >= F.Config.MIN_VISIBLE_DEPTH_MM then
                 local e = exposure[c]
                 if not e then e = { rain = 0, wade = 0, toxic_water = 0, deep = 0 }; exposure[c] = e end

@@ -9,6 +9,9 @@ Flood.Config = {
     CELL_SIZE_M = 4,
     MAX_GRID_CELLS = 262144,
     SAMPLE_YIELD_ROWS = 8,
+    REBUILD_SLICE_MS = 100,       -- real time a terrain rebuild runs per slice
+    REBUILD_SLICE_SLEEP_MS = 100, -- time between rebuild slices (instead of TICK_MS)
+    PAUSED_TICK_MS = 500,         -- real time between redraws while the game is paused
     SUBSAMPLE_M = 4,                  -- spacing of the sub-samples whose minimum is a cell's height
     MAX_SUBSAMPLES = 4,               -- per axis (so up to 16 height reads per cell)
     TICK_MS = 3000,                   -- game ms between simulation steps (1/10 game hour)
@@ -26,8 +29,9 @@ Flood.Config = {
     MAX_RENDERED_POOLS = 400,         -- largest pools drawn; smaller ones still count in the model
     LARGE_LAKE_PLANES = 2000,         -- lakes this big (native water planes) redraw in coarser steps
     LARGE_LAKE_STEP_MM = 250,         -- level change that redraws a large lake
-    MARKER_AREA_SLACK = 3,            -- rendered area may exceed the model's wetted area by this factor
-    MIN_MARKER_AREA_M2 = 2000,        -- before the engine lowers a surface to stop it spilling
+    MARKER_AREA_SLACK = 1.25,         -- drawn area may exceed the model's wetted area by at most this factor;
+                                      -- the engine lowers a surface rather than draw water the model lacks
+    MIN_MARKER_AREA_M2 = 600,         -- floor for tiny pools (about two 16 m cells)
     FRESH_COLOR = { 90, 151, 170 },
     TOXIC_COLOR = { 161, 181, 59 },
     UI_LEFT = 24,
@@ -123,4 +127,14 @@ Flood.Config = {
     WADING_SANITY_PER_HOUR = 3,
     DROWNING_DEPTH_MM = 1400,
     DROWNING_HEALTH_PER_HOUR = 30,
+
+    -- Ice: frozen puddles and lakes get a walkable surface (Martian Waters-style plates).
+    ENABLE_ICE = true,
+    ICE_PLANET_COLD = true,           -- frozen while the planet's water is frozen (vanilla WaterFrozen)
+    ICE_FREEZE_HEAT = 100,            -- local heat below this freezes water (const.DefaultFreezeHeat)
+    ICE_THAW_MARGIN = 16,             -- heat above the freeze level before ice thaws
+    ICE_TILE_M = 30,                  -- ice plate size
+    MAX_ICE_PLATES = 4000,
+    ICE_BUDGET_MS = 30,               -- real time per redraw spent building ice
+    ICE_SUBLIMATION_FACTOR = 0.1,     -- evaporation share while the planet's water is frozen
 }

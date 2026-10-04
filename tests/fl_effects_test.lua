@@ -12,6 +12,10 @@ end
 guim = 1000
 const = { HourDuration = 30000, HeightTileSize = 1000, ResourceScale = 1000, SoilGridScale = 100,
     GridSpacing = 10000, MaxMaintenance = 100000, Scale = { Stat = 1000 } }
+Platform = {}
+EntityData = {}
+function IsValidEntity() return true end
+function DeleteOnLoadGame() end
 g_Classes = { SubsurfaceDepositWater = {}, CargoShuttle = {}, ShuttleHubBase = {}, FloodWaterMarker = {} }
 MapVarValues = {}
 function MapVar(name, value) assert(MapVarValues[name] == nil, "map var registered twice"); MapVarValues[name] = value or false end
@@ -154,6 +158,9 @@ MainMap = { City = { labels = { Building = { bld_deep, bld_dry, dome, track, hub
 function MainMap.City:SetLabelModifier(label, id, mod) labels_mods[label .. id] = mod end
 function MainMap:MapGet(pt, radius, class) return class == "SubsurfaceDepositWater" and deposits or {} end
 function MainMap:IsValid() return true end
+local pass_edits = 0
+function MainMap:SuspendPassEdits() pass_edits = pass_edits + 1 end
+function MainMap:ResumePassEdits() pass_edits = pass_edits - 1; assert(pass_edits >= 0, "unbalanced pass edits") end
 local s = F.State
 s.map, s.grid, s.model, s.enabled = MainMap, grid, model, true
 local MODULES = { climate = "Climate", buildings = "Buildings", dust = "Dust", vehicles = "Vehicles",
@@ -345,6 +352,8 @@ check(#controller.construction_statuses == 0, "disabled: vanilla pass-through")
 local game_time = 0
 function GameTime() return game_time end
 function IsValidThread() return false end
+GameState = { gameplay = true }
+function IsChangingMap() return false end
 function CurrentThread() return nil end
 function DeleteThread() end
 g_RainDisaster = false
@@ -369,12 +378,103 @@ for _ = 1, 40 do
     F.Lifecycle.Tick()
     game_time = game_time + F.Config.TICK_MS
 end
-check(s.model and s.last_effects and s.ticks == 40, "lifecycle ticks with all effects")
+-- The first tick builds the model (one slice: the stub clock never advances) and
+-- does nothing else; the other 39 run the effects.
+check(s.model and s.last_effects and s.ticks == 39 and not s.building, "lifecycle ticks with all effects")
+
+-- Terrain rebuild job: sliced across ticks by real time, old model kept meanwhile.
+do
+    local real_clock = GetPreciseTicks
+    local clock = 0
+    GetPreciseTicks = function() clock = clock + F.Config.REBUILD_SLICE_MS; return clock end -- one resume per slice
+    local yield_rows = F.Config.SAMPLE_YIELD_ROWS
+    F.Config.SAMPLE_YIELD_ROWS = 1 -- the stub grid is small: yield every row
+    local old_model = s.model
+    s.grid, s.dirty = false, true -- the next tick rescans and sees changed terrain
+    F.Lifecycle.Tick()
+    check(s.rebuild_job and s.building and s.model == old_model, "rebuild runs as a job and keeps the old model")
+    local ticks_before, slices = s.ticks, 1
+    while s.rebuild_job and slices < 10000 do F.Lifecycle.Tick(); slices = slices + 1 end
+    check(not s.rebuild_job and not s.building and s.model ~= old_model and s.grid, "rebuild job finishes and installs")
+    check(slices > 1 and s.ticks == ticks_before, "rebuild spans several slices with no effect passes")
+    s.grid, s.dirty = false, true
+    F.Lifecycle.Tick()
+    check(s.rebuild_job, "second rebuild started")
+    F.Terrain.CancelRebuild()
+    check(not s.rebuild_job and not s.building and s.dirty == true, "cancel drops the job and rescans later")
+    F.Terrain.CancelRebuild()
+    check(not s.rebuild_job, "cancel is idempotent")
+    -- A failing job raises its error and leaves no job behind.
+    local real_sample = F.Terrain.Sample
+    F.Terrain.Sample = function() error("sample exploded") end
+    F.Terrain.StartRebuild(MainMap)
+    local ok, err = pcall(F.Terrain.StepRebuild)
+    check(not ok and tostring(err):find("sample exploded", 1, true) and not s.rebuild_job and not s.building,
+        "failed rebuild raises and cancels")
+    F.Terrain.Sample = real_sample
+    -- Paused: the paused tick finishes a scan and draws, but never steps water.
+    while s.dirty or s.rebuild_job do F.Lifecycle.Tick() end
+    local total, last_tick, effect_ticks = F.Hydrology.Total(s.model), s.last_tick, s.ticks
+    s.grid, s.dirty = false, true
+    GeneratingMap = true
+    F.Lifecycle.PausedTick()
+    check(not s.rebuild_job, "paused tick waits while a map is being generated")
+    GeneratingMap = nil
+    local paused_slices = 0
+    repeat F.Lifecycle.PausedTick(); paused_slices = paused_slices + 1 until not s.rebuild_job or paused_slices > 10000
+    check(not s.rebuild_job and not s.dirty and s.grid and paused_slices > 1, "paused tick finishes a terrain scan")
+    check(s.wet == false, "finished scan leaves the snapshot to the next draw")
+    F.Lifecycle.PausedTick()
+    check(s.wet ~= false, "paused tick draws the water")
+    check(math.abs(F.Hydrology.Total(s.model) - total) < 1e-6 and s.last_tick == last_tick and s.ticks == effect_ticks,
+        "paused tick never steps water or runs effects")
+    s.enabled = false
+    s.grid, s.dirty = false, true
+    F.Lifecycle.PausedTick()
+    check(not s.rebuild_job, "paused tick does nothing while Flood is disabled")
+    s.enabled = true
+    GetPreciseTicks = real_clock
+    F.Config.SAMPLE_YIELD_ROWS = yield_rows
+end
 F.Lifecycle.SaveStart()
 check(s.saving and labels_mods.DroneFloodRainDrones == nil, "save drops transient modifiers")
 F.Lifecycle.SaveDone()
 F.Lifecycle.Disable()
 check(not s.enabled and bld_deep.suspended == false, "disable restores object state")
+check(pass_edits == 0, "pass edits resumed after every suspension")
+
+
+-- Ice heat lookup: Heat_Get errors outside the heat grid (map minus HeatGridBorder).
+do
+    Clamp = Clamp or function(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+    const.HeatGridBorder, const.MaxHeat = 2000, 255
+    local asked = {}
+    local heat_grid = { map_width = 100000, map_height = 80000, GetHeatAtXY = function(_, x, y)
+        assert(x >= 2000 and x < 98000 and y >= 2000 and y < 78000, "heat lookup outside the grid")
+        asked[#asked + 1] = { x, y }; return 50 end }
+    local saved_map, saved_ice, saved_cold = s.map, s.features.ice, F.Config.ICE_PLANET_COLD
+    s.map, s.features.ice, F.Config.ICE_PLANET_COLD = { heat_grid = heat_grid }, true, false
+    check(F.Ice.FrozenAt(-500, 90000) == true and asked[1][1] == 2000 and asked[1][2] == 77999,
+        "ice heat at the map edge reads the nearest covered tile")
+    check(F.Ice.FrozenAt(50000, 40000) == true and asked[2][1] == 50000, "ice heat inside the grid is unchanged")
+    s.map.heat_grid = nil
+    check(F.Ice.FrozenAt(50000, 40000) == false, "no heat grid: not frozen (MaxHeat, as vanilla GetHeatAt)")
+    -- Frost test button: Auto -> On -> Off -> Auto.
+    check(F.Ice.TestFrost() == "auto" and F.Ice.CycleTestFrost() == true and F.Ice.TestFrost() == "on"
+        and F.Ice.FrozenAt(50000, 40000) == true and F.Ice.MapFrozen() == true, "frost on freezes every pool")
+    s.map.heat_grid = heat_grid
+    check(F.Ice.CycleTestFrost() == true and F.Ice.TestFrost() == "off" and F.Ice.FrozenAt(50000, 40000) == false
+        and F.Ice.MapFrozen() == false, "frost off thaws even where it is locally cold")
+    check(F.Ice.CycleTestFrost() == true and F.Ice.TestFrost() == "auto" and F.Ice.FrozenAt(50000, 40000) == true,
+        "frost auto follows the climate again")
+    F.Ice.CycleTestFrost()
+    F.Ice.StopTestFrost()
+    check(F.Ice.TestFrost() == "auto", "stopping test frost clears the override")
+    s.features.ice = false
+    local ok_off, err_off = F.Ice.CycleTestFrost()
+    check(ok_off == false and err_off ~= nil and F.Ice.TestFrost() == "auto", "frost button refused while ice is off")
+    s.map, s.features.ice, F.Config.ICE_PLANET_COLD = saved_map, saved_ice, saved_cold
+end
 
 print = real_print
 print("PASS: " .. count .. " effect assertions")

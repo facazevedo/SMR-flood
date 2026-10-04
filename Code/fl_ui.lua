@@ -1,4 +1,4 @@
--- Temporary test panel: Light / Moderate / Heavy storm toggles and Fresh / Toxic.
+-- Temporary test panel: Light / Moderate / Heavy storm toggles, Fresh / Toxic and Frost.
 -- Pattern follows Martian Waters' HUD panel (XDialog parented to GetHUD()).
 local F = Flood
 local UI = {}
@@ -9,6 +9,7 @@ local BUTTON_BG = RGBA(32, 46, 56, 235)
 local BUTTON_ACTIVE = RGBA(40, 130, 110, 245)
 local BUTTON_TOXIC = RGBA(120, 132, 40, 245)
 local BUTTON_HOVER = RGBA(48, 74, 90, 245)
+local BUTTON_FROST = RGBA(70, 118, 168, 245)
 local STRENGTH_NAMES = { "Light", "Moderate", "Heavy" }
 
 local function alive(win)
@@ -57,6 +58,7 @@ local function show()
         button(panel, "idRain" .. strength, function() return F.Rain.Toggle(strength) end)
     end
     button(panel, "idType", function() return F.Rain.ToggleType() end)
+    button(panel, "idFrost", function() return F.Ice.CycleTestFrost() end)
     XText:new({ Id = "idStatus", TextStyle = TEXT_STYLE, Translate = false, Text = "" }, panel)
     if panel.window_state == "new" then panel:Open() end
     F.State.ui = panel
@@ -73,6 +75,9 @@ local function status_lines(s)
             s.wet_pools or 0, s.visible_pools or 0, F.Hydrology.Total(s.model) / 1000)
         lines[#lines + 1] = string.format("Flooded buildings %d, slowed rovers %d",
             s.flooded_buildings or 0, s.slowed_rovers or 0)
+        if (s.frozen_pools or 0) > 0 then
+            lines[#lines + 1] = string.format("Frozen pools %d, ice plates %d", s.frozen_pools, s.ice_plates or 0)
+        end
     end
     return table.concat(lines, "\n")
 end
@@ -90,6 +95,10 @@ function UI.Refresh()
     end
     set_button(panel.idType, s.rain_type == "toxic" and "Rain type: Toxic" or "Rain type: Fresh",
         s.rain_type == "toxic" and BUTTON_TOXIC or BUTTON_BG)
+    local frost = F.Ice.TestFrost()
+    local frost_text = frost == "on" and "Frost: On (click: Off)" or frost == "off" and "Frost: Off (click: Auto)"
+        or string.format("Frost: Auto, %s (click: On)", F.Ice.PlanetFrozen() and "planet frozen" or "local cold only")
+    set_button(panel.idFrost, frost_text, frost == "on" and BUTTON_FROST or BUTTON_BG)
     if alive(panel.idStatus) then panel.idStatus:SetText(status_lines(s)) end
 end
 
