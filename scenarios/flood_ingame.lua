@@ -37,6 +37,8 @@ local function model_idle(ctx, F)
 end
 local function pour(ctx, F, records)
     model_idle(ctx, F)
+    -- The water step runs in pacer slices: finish it, never write mid-step.
+    F.Lifecycle.Advance(true)
     F.Hydrology.Import(F.State.model, records)
 end
 
@@ -67,7 +69,28 @@ local function popup_blocking(ctx)
         if not GetDialog("PopupNotification") then return false end
     end
     ctx:record("blocking_popup", tostring(id))
+    if id == "?" then
+        -- An id-less popup: record what it is, to find its source.
+        local context, keys = popup.context or {}, {}
+        for k, v in pairs(context) do keys[#keys + 1] = tostring(k) .. "=" .. string.sub(tostring(v), 1, 60) end
+        ctx:record("unknown_popup", { class = tostring(popup.class), context = keys,
+            title = popup.idTitle and string.sub(tostring(popup.idTitle:GetText()), 1, 120) or "?",
+            text = popup.idText and string.sub(tostring(popup.idText:GetText()), 1, 200) or "?" })
+    end
     return true
+end
+
+-- The hourly soil pass is a background job sharing the pacer's budget; under
+-- load (10x speed, a flooded map) it finishes after its hour, with the hours
+-- that passed meanwhile folded in. Waits for it and records how long it took.
+local function wait_soil(ctx, F, label)
+    local t0 = RealTime()
+    local done = ctx:wait_for(function() popup_blocking(ctx); return not F.Soil.Pending() end, 120000)
+    local waits = ctx.soil_waits or {}
+    waits[#waits + 1] = label .. ":" .. (RealTime() - t0) .. "ms"
+    ctx.soil_waits = waits
+    ctx:record("soil_pass_waits", waits)
+    return done
 end
 
 local function wait_effect_passes(ctx, n, timeout_ms)
@@ -123,11 +146,12 @@ local function unguard_flight()
     guarded = nil
 end
 
-HARNESS.scenario("flood_00_new_game", function(ctx)
-    ctx:assert(FL() ~= nil, "Flood mod code loaded")
-    if not FL() then ctx:fail("Flood not loaded") end
+-- Starts a fresh colony on a fixed random map (works with Flood on or off),
+-- from the main menu or from a running game (DoneGame ends it).
+local function new_colony(ctx)
     ctx:wait_for(function()
-        return GetDialog("PGMainMenu") and not (rawget(_G, "IsChangingMap") and IsChangingMap())
+        return (GetDialog("PGMainMenu") or (GameState.gameplay and MainMap and MainMap:IsValid()))
+            and not (rawget(_G, "IsChangingMap") and IsChangingMap())
     end, 180000)
     DoneGame()
     NewGame()
@@ -149,6 +173,12 @@ HARNESS.scenario("flood_00_new_game", function(ctx)
     unguard_flight()
     ctx:assert(MainMap and MainMap:IsValid() and HasGameLogic(MainMap), "surface map with game logic")
     ctx:assert(CurrentMap == MainMap, "viewing the surface map")
+end
+
+HARNESS.scenario("flood_00_new_game", function(ctx)
+    ctx:assert(FL() ~= nil, "Flood mod code loaded")
+    if not FL() then ctx:fail("Flood not loaded") end
+    new_colony(ctx)
     local F = FL()
     -- Test maps are unterraformed, so the planet's water is frozen (vanilla
     -- WaterFrozen) and every lake would be ice. The liquid-water scenarios run with
@@ -547,6 +577,7 @@ HARNESS.scenario("flood_40_ground_and_people", function(ctx)
     deposit.amount = 100 * const.ResourceScale
     SetTimeFactor(const.DefaultTimeFactor * 10) -- faster (30x) measured slower: the game cannot keep up
     wait_effect_passes(ctx, 3)
+    wait_soil(ctx, F, "fresh")
     ctx:record("deposit_units", { before = 100, after = deposit.amount / const.ResourceScale })
     ctx:assert(deposit.amount > 100 * const.ResourceScale, "fresh seepage recharged the deposit")
     local soil_fresh = GetSoilQuality(q, r)
@@ -563,8 +594,12 @@ HARNESS.scenario("flood_40_ground_and_people", function(ctx)
         if pool.volume > pool.mass then contaminate[#contaminate + 1] = { pool.seed, 0, pool.volume - pool.mass } end
     end
     pour(ctx, F, contaminate)
+    -- Fresh seepage collected before the contamination is applied on the next
+    -- effect pass; measure from there.
+    wait_effect_passes(ctx, 1)
     local deposit_toxic = deposit.amount
     wait_effect_passes(ctx, 3)
+    wait_soil(ctx, F, "toxic")
     local soil_toxic = GetSoilQuality(q, r)
     ctx:record("soil_toxic", soil_toxic)
     ctx:assert(soil_toxic < soil_fresh, "toxic water lowered soil quality")
@@ -583,6 +618,7 @@ HARNESS.scenario("flood_40_ground_and_people", function(ctx)
     F.Water.Snapshot()
     local soil_dry = GetSoilQuality(rq, rr)
     wait_effect_passes(ctx, 3)
+    wait_soil(ctx, F, "residue")
     ctx:record("soil_residue", { before = soil_dry, after = GetSoilQuality(rq, rr) })
     ctx:assert(soil_dry >= 35 and GetSoilQuality(rq, rr) < soil_dry, "dried residue lowers soil")
     if IsValid(deposit) then DoneObject(deposit) end
@@ -989,9 +1025,11 @@ HARNESS.scenario("flood_70_ice", function(ctx)
     SetTimeFactor(const.DefaultTimeFactor)
     ctx:record("thawed_marker_still_drawn", IsValid(entry.obj))
     ctx:assert(#MainMap:MapGet("map", "FloodIcePlate") == 0, "no ice plates left on the map")
-    local thaw_z = GetWalkableZ(MainMap, ex, ey)
-    ctx:record("thawed_walkable_z", thaw_z)
-    ctx:assert(thaw_z < frozen_water_z - guim / 2, "thawed: walkable surface back to the lakebed")
+    local thaw_z, bed_now = GetWalkableZ(MainMap, ex, ey), terrain.GetHeight(MainMap, point(ex, ey))
+    ctx:record("thawed_walkable_z", { walkable_z = thaw_z, terrain_z = bed_now, ice_z = frozen_water_z })
+    -- The lake can be shallow (the largest frozen one after earlier scenarios):
+    -- the lakebed is the terrain, not necessarily far below the old ice.
+    ctx:assert(thaw_z <= bed_now + guim / 10 and thaw_z < frozen_water_z, "thawed: walkable surface back to the lakebed")
     ctx:assert((not IsValid(entry.obj) or entry.frozen == false) and s.frozen_pools == 0, "thawed lake styled as water again")
     if IsValid(rover) then DoneObject(rover) end
     cfg.ICE_PLANET_COLD = planet_cold
@@ -1153,7 +1191,11 @@ HARNESS.scenario("flood_90_terrain_edits", function(ctx)
     MainMap:SuspendPassEdits("FloodTerrainEditTest")
     terrain.SetHeightCircle(MainMap, spot, 20 * guim, 30 * guim, ground - 8 * guim, const.hsMin)
     MainMap:ResumePassEdits("FloodTerrainEditTest")
-    ctx:record("dig", { ground = ground, after = terrain.GetHeight(MainMap, spot) })
+    -- A full rolling sweep of a big map takes longer than this scenario may wait;
+    -- what is tested is that the check finds the edit, so start it two rows above.
+    local pit_row = (cell - 1) // s.terrain.width
+    s.check_row, s.check_col = math.max(0, pit_row - 2), 0
+    ctx:record("dig", { ground = ground, after = terrain.GetHeight(MainMap, spot), check_row = s.check_row })
     ctx:assert(terrain.GetHeight(MainMap, spot) < ground, "pit dug")
     local model0, last_tick0 = s.model, s.last_tick
     SetTimeFactor(const.DefaultTimeFactor * 10)
@@ -1299,3 +1341,8 @@ HARNESS.scenario("flood_95_terraformed_button", function(ctx)
     ctx:wait_for(function() return (s.ice_plates or 0) == 0 and (s.ice_backlog or 1) == 0 end, 300000)
     no_flood_error(ctx, "end")
 end)
+
+-- Shared with scenarios/manual/flood_save_compat.lua (loaded alongside this file and
+-- run by name, with Flood switched off and on between its scenarios).
+FloodScenarioKit = { FL = FL, new_colony = new_colony, pick_basin = pick_basin, pour = pour,
+    popup_blocking = popup_blocking, wait_render = wait_render, at = at }

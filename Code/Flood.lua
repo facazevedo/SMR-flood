@@ -6,8 +6,9 @@ function OnMsg.PostLoadGame() F.Lifecycle.Enable() end
 function OnMsg.DoneMap(map) F.Lifecycle.MapDone(map) end
 function OnMsg.SaveGameStart() F.Lifecycle.SaveStart() end
 function OnMsg.SaveGameDone() F.Lifecycle.SaveDone() end
-function OnMsg.RainDisasterStart() F.Lifecycle.Advance() end
-function OnMsg.RainDisasterEnd() F.Lifecycle.Advance() end
+-- A rain change applies from now on: bring the water up to date first.
+function OnMsg.RainDisasterStart() F.Lifecycle.Advance(true) end
+function OnMsg.RainDisasterEnd() F.Lifecycle.Advance(true) end
 -- Announced terrain edits; the terrain module re-reads only their area.
 -- LandscapeCompleted fires after the landscape is deleted: its pass_bbox (world
 -- box, Landscaping.lua:259-264) is still on the table.

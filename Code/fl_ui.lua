@@ -78,6 +78,8 @@ local function status_lines(s)
             s.wet_pools or 0, s.visible_pools or 0, F.Hydrology.Total(s.model) / 1000)
         lines[#lines + 1] = string.format("Flooded buildings %d, slowed rovers %d",
             s.flooded_buildings or 0, s.slowed_rovers or 0)
+        local worst_ms, worst_name = F.Diagnostics.Worst()
+        lines[#lines + 1] = string.format("Slowest Flood step (10 s): %d ms, %s", worst_ms, worst_name)
         if (s.frozen_pools or 0) > 0 then
             lines[#lines + 1] = string.format("Frozen pools %d, ice plates %d", s.frozen_pools, s.ice_plates or 0)
         end

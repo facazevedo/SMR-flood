@@ -285,15 +285,15 @@ end
 
 -- Brings drawn lakes' ice in line with their frozen state, a little at a time:
 -- restyles, melting, scanning, placing and moving all share ICE_BUDGET_MS of
--- real time per call. Melting goes first, then the largest lakes.
--- s.ice_backlog counts lakes and melt lists still waiting; while it is above
--- zero the simulation thread calls this every REBUILD_SLICE_SLEEP_MS.
-function I.Refresh()
+-- real time per call (less when the pacer passes a smaller budget_ms). Melting
+-- goes first, then the largest lakes. s.ice_backlog counts lakes and melt lists
+-- still waiting; while it is above zero the pacer keeps calling this.
+function I.Refresh(budget_ms)
     local s, cfg = F.State, F.Config
     if not s.map or not s.markers then return end
     s.ice_melt = s.ice_melt or {}
     local started = GetPreciseTicks()
-    local deadline = started + cfg.ICE_BUDGET_MS
+    local deadline = started + math.min(budget_ms or cfg.ICE_BUDGET_MS, cfg.ICE_BUDGET_MS)
     local relevel = cfg.ICE_RELEVEL_MM * guim / 1000
     local frozen_pools, work, restyle_pending = 0, {}, 0
     -- Longest time per phase of one refresh (diagnostics and tests).

@@ -101,6 +101,26 @@ function B.Hourly(hours, rain_mm_h, toxic)
     B.UpdateCorrosion(hours, rain_mm_h, toxic)
 end
 
+-- Saves never hold a Flood suspension: a save loaded after Flood is removed
+-- would keep those buildings switched off for good. They are lifted before the
+-- save and put back right after it; after a load the first completed snapshot
+-- re-checks flooding (the pacer in fl_lifecycle.lua).
+local resuspend = {}
+
+function B.PreSave()
+    resuspend = {}
+    each_outdoor_building(function(bld)
+        if bld.suspended == REASON then bld:SetSuspended(false, REASON); resuspend[#resuspend + 1] = bld end
+    end)
+end
+
+function B.PostSave()
+    for _, bld in ipairs(resuspend) do
+        if IsValid(bld) and not bld.suspended then bld:SetSuspended(true, REASON) end
+    end
+    resuspend = {}
+end
+
 -- Lift every Flood suspension on the surface map. Idempotent.
 function B.Restore()
     local restored = 0

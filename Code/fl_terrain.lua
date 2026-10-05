@@ -9,8 +9,8 @@ F.Terrain = T
 --     prefabs (meteor craters, lakes, crystals: PrefabPlaced), landscaping
 --     (LandscapeCompleted) and dome height surfaces (ConstructionComplete);
 --   * silent edits (excavators, regolith extractors, Mirror Sphere digging send
---     no message): a rolling check re-reads TERRAIN_CHECK_ROWS_PER_TICK rows per
---     tick and cycles over the whole map.
+--     no message): a rolling check re-reads cells for TERRAIN_CHECK_MS of real
+--     time per tick and cycles over the whole map.
 -- When heights changed, the depression hierarchy is rebuilt in the background
 -- while the simulation keeps running on the current model, then handed over.
 --
@@ -18,9 +18,9 @@ F.Terrain = T
 -- lines on a 6 km map. The engine's infinite-loop watchdog stops a thread at
 -- about 30M lines and in-game counted straight through Sleep(0) yields
 -- ("sleeps 65", "sleeps 78" in its reports). So that work runs as a coroutine
--- job resumed for a few milliseconds at a time; between resumes the simulation
--- thread takes a timed Sleep (REBUILD_SLICE_SLEEP_MS), the kind of wait that ends
--- every simulation tick.
+-- job resumed for a few milliseconds at a time; between resumes the pacer
+-- thread (fl_lifecycle.lua) takes a timed Sleep (BACKGROUND_WAKE_MS), the kind
+-- of wait that ends every simulation tick.
 local job_co = false
 local phase = "read" -- the job's current phase, for slice diagnostics
 local resumed_at = 0
@@ -143,27 +143,37 @@ local function note_change(changed, source)
     F.Log("Terrain", "terrain heights changed", { cells = changed, source = source })
 end
 
--- Called every simulation tick: re-reads queued edit boxes (at most
--- TERRAIN_BOX_CELLS_PER_TICK cells) and the next TERRAIN_CHECK_ROWS_PER_TICK rows
--- of the rolling check. Cheap; never reads the whole map.
+-- Reads go in chunks of up to 64 cells of one row within TERRAIN_CHECK_MS of
+-- real time per call: announced edit boxes first, then the rolling check, which
+-- keeps its place (row and column) between calls.
+local CHUNK = 64
+
 function T.Track()
     local s, cfg = F.State, F.Config
     local grid = s.terrain
     if not grid or not s.map then return end
-    local budget = cfg.TERRAIN_BOX_CELLS_PER_TICK
-    while budget > 0 and #s.terrain_boxes > 0 do
+    local deadline = GetPreciseTicks() + cfg.TERRAIN_CHECK_MS
+    while #s.terrain_boxes > 0 do
         local b = s.terrain_boxes[1]
-        local rows = math.max(1, math.floor(budget / (b.x1 - b.x0 + 1)))
-        local last = math.min(b.y1, b.row + rows - 1)
-        note_change(read_cells(s.map, grid, b.x0, b.x1, b.row, last), b.reason or "edit")
-        budget = budget - (last - b.row + 1) * (b.x1 - b.x0 + 1)
-        b.row = last + 1
+        b.col = b.col or b.x0
+        local last = math.min(b.x1, b.col + CHUNK - 1)
+        note_change(read_cells(s.map, grid, b.col, last, b.row, b.row), b.reason or "edit")
+        if last >= b.x1 then b.col, b.row = b.x0, b.row + 1 else b.col = last + 1 end
         if b.row > b.y1 then table.remove(s.terrain_boxes, 1) end
+        if GetPreciseTicks() >= deadline then return end
     end
-    local first = s.check_row or 0
-    local last = math.min(grid.height - 1, first + cfg.TERRAIN_CHECK_ROWS_PER_TICK - 1)
-    note_change(read_cells(s.map, grid, 0, grid.width - 1, first, last), "rolling check")
-    s.check_row = last + 1 < grid.height and last + 1 or 0
+    local read, cells = 0, grid.width * grid.height
+    repeat
+        local row, col = s.check_row or 0, s.check_col or 0
+        local last = math.min(grid.width - 1, col + CHUNK - 1)
+        note_change(read_cells(s.map, grid, col, last, row, row), "rolling check")
+        if last >= grid.width - 1 then
+            s.check_col, s.check_row = 0, row + 1 < grid.height and row + 1 or 0
+        else
+            s.check_col = last + 1
+        end
+        read = read + (last - col + 1)
+    until GetPreciseTicks() >= deadline or read >= cells -- at most one sweep per call
 end
 
 -- A rebuild is due when there is no model yet, or when heights changed and have
@@ -248,10 +258,11 @@ end
 -- Resumes the job for one slice: BACKGROUND_SLICE_MS while a model is running,
 -- REBUILD_SLICE_MS for the first build. Returns true once it has finished and
 -- its result is installed. A failure cancels the job and raises its error.
-function T.StepRebuild()
+function T.StepRebuild(budget_ms)
     local s = F.State
     local job = s.rebuild_job
     local slice = job.background and F.Config.BACKGROUND_SLICE_MS or F.Config.REBUILD_SLICE_MS
+    if budget_ms then slice = math.min(slice, budget_ms) end
     local started = GetPreciseTicks()
     job.slices = job.slices + 1
     if job.handover then job.handover_slices = job.handover_slices + 1 end

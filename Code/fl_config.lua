@@ -11,12 +11,9 @@ Flood.Config = {
     SAMPLE_YIELD_ROWS = 1,
     REBUILD_SLICE_MS = 100,       -- first terrain read and model: real time per slice
     BACKGROUND_SLICE_MS = 15,     -- rebuild while the simulation runs: real time per slice
-    REBUILD_SLICE_SLEEP_MS = 100, -- time between rebuild slices
-    TERRAIN_CHECK_ROWS_PER_TICK = 2,     -- rolling check for unannounced terrain edits
-    TERRAIN_BOX_CELLS_PER_TICK = 4096,   -- announced edits re-read per tick
+    TERRAIN_CHECK_MS = 3,                -- real time per tick re-reading terrain (edits, then the rolling check)
     TERRAIN_SETTLE_MS = 6000,            -- real time without new edits before a rebuild
     TERRAIN_YIELD_MS = 4,                -- real time a terrain job runs between yields
-    PAUSED_TICK_MS = 500,         -- real time between redraws while the game is paused
     SUBSAMPLE_M = 4,                  -- spacing of the sub-samples whose minimum is a cell's height
     MAX_SUBSAMPLES = 4,               -- per axis (so up to 16 height reads per cell)
     TICK_MS = 3000,                   -- game ms between simulation steps (1/10 game hour)
@@ -33,6 +30,7 @@ Flood.Config = {
     MAX_RENDERED_POOLS = 400,         -- largest pools drawn; smaller ones still count in the model
     LARGE_LAKE_PLANES = 2000,         -- lakes this big (native water planes) redraw in coarser steps
     LARGE_LAKE_STEP_MM = 250,         -- level change that redraws a large lake
+    SLOW_FILL_MS = 50,                -- a lake whose fill took longer waits proportionally longer to redraw
     MARKER_AREA_SLACK = 1.25,         -- drawn area may exceed the model's wetted area by at most this factor;
                                       -- the engine lowers a surface rather than draw water the model lacks
     MIN_MARKER_AREA_M2 = 600,         -- floor for tiny pools (about two 16 m cells)
@@ -43,8 +41,13 @@ Flood.Config = {
 
     -- Gameplay effects. Each ENABLE_* switch is independent.
     DEBUG_EFFECTS = true,             -- per-pass effect summaries; also requires DEBUG_LOGS
+    BACKGROUND_WAKE_MS = 50,          -- real time between background work wakes (any game speed)
+    BACKGROUND_BUDGET_MS = 8,         -- real time all background work shares per wake
+    WATER_STEP_BUDGET_MS = 6,         -- real time per slice of the water step (rain, balance, drying)
+    EFFECT_STEP_BUDGET_MS = 4,        -- real time per slice of the hourly soil pass
     SNAPSHOT_BUDGET_MS = 6,           -- real time per step keeping the depth snapshot current
     RESTYLE_BUDGET_MS = 4,            -- real time per step copying water colours to lake planes
+    PROFILE_WINDOW_MS = 10000,        -- real time over which the panel shows Flood's slowest step
     SNAPSHOT_LEVEL_EPS_MM = 1,        -- level change below which a lake's cells are not rewalked
     EFFECT_INTERVAL_HOURS = 1,        -- cadence of building, soil and groundwater effects
 

@@ -214,4 +214,33 @@ do
     for node, entry in pairs(tracker.cache) do assert(before[node] == entry, 'unchanged pool was walked again') end
     compare('unchanged pass')
 end
+-- Rain per node (sorted cell elevations) equals the old per-cell distribution.
+do
+    local w, heights = 40, {}
+    for i = 1, w * w do heights[i] = math.random(0, 25) * 100 + ((i % w) - w / 2) ^ 2 * 3 end
+    local a, b = H.Build(w, w, heights, 16), H.Build(w, w, heights, 16)
+    local seed_water = {}
+    for i = 1, w * w, 37 do seed_water[#seed_water + 1] = { i, 200000, 30000 } end
+    H.Import(a, seed_water); H.Import(b, seed_water)
+    local hours, rain, runoff = 0.5, 40, 0.65
+    -- Reference: the old per-cell loop.
+    local per_cell = hours * rain * b.area
+    local wet = H.WetCells(b)
+    local outlet = 0
+    for i, sink in ipairs(b.sinks) do
+        local amount = per_cell * (wet[i] and 1 or runoff)
+        if sink == 0 then outlet = outlet + amount
+        else local n = b.nodes[sink]; n.water = n.water + amount; n.mass = n.mass + amount end
+    end
+    b.budget.outflow = b.budget.outflow + outlet
+    H.Balance(b)
+    H.Step(a, hours, rain, true, 0, 0, runoff)
+    for id, na in ipairs(a.nodes) do
+        local nb = b.nodes[id]
+        assert(math.abs(na.water - nb.water) < 1e-6 * (1 + nb.water), 'rain per node differs at node ' .. id)
+        assert(math.abs(na.mass - nb.mass) < 1e-6 * (1 + nb.mass), 'tracer per node differs at node ' .. id)
+    end
+    assert(math.abs(a.budget.outflow - b.budget.outflow) < 1e-6 * (1 + b.budget.outflow), 'outflow differs')
+    count = count + 1
+end
 print('PASS: ' .. count .. ' hydrology assertions')

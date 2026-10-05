@@ -2,6 +2,7 @@ return {
     PlaceObj('ModItemCode', { 'name', "fl_config", 'CodeFileName', "Code/fl_config.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_entity_data", 'CodeFileName', "Code/fl_entity_data.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_debug", 'CodeFileName', "Code/fl_debug.lua" }),
+    PlaceObj('ModItemCode', { 'name', "fl_diagnostics", 'CodeFileName', "Code/fl_diagnostics.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_state", 'CodeFileName', "Code/fl_state.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_hydrology", 'CodeFileName', "Code/fl_hydrology.lua" }),
     PlaceObj('ModItemCode', { 'name', "fl_save", 'CodeFileName', "Code/fl_save.lua" }),

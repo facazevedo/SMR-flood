@@ -4,7 +4,7 @@ local F = Flood
 -- a second MapVar call on mod reload would assert "already registered".
 if MapVarValues.fl_saved == nil then MapVar("fl_saved", false) end
 F.State = { enabled = false, thread = false, map = false, model = false,
-    markers = {}, retiring = {}, ui = false, building = false, rebuild_job = false, paused_thread = false,
+    markers = {}, retiring = {}, ui = false, building = false, rebuild_job = false, water_job = false, snapshot_due = false, redraw_due = false, ice_due = false, pacer_turn = 0, paused_thread = false,
     terrain = false, terrain_boxes = {}, check_row = 0, terrain_changed = false, terrain_changed_at = 0, saving = false, dirty = true,
     status = "Waiting for surface map", rain_type = "normal", rain_strength = 0,
     rain_thread = false, fast_preview = true, error = false,

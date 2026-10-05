@@ -165,6 +165,19 @@ function H.Build(width, height, elevations, cell_area, yield_fn)
         if yield_fn and i % 1024 == 0 then yield_fn() end
     end
     model.cells_of = cells_of
+    -- The elevations of each node's cells, sorted: rain counts the wet ones with a
+    -- binary search against the covering lake's level (see H.Step).
+    local cell_z = {}
+    local k = 0
+    for id, list in pairs(cells_of) do
+        local zs = {}
+        for j, i in ipairs(list) do zs[j] = elevations[i] end
+        table.sort(zs)
+        cell_z[id] = zs
+        k = k + #list
+        if yield_fn and k >= 4096 then k = 0; yield_fn() end
+    end
+    model.cell_z = cell_z
     return model
 end
 
@@ -205,9 +218,9 @@ end
 -- walk below therefore uses an explicit stack, visiting nodes and summing in the
 -- same order as the equivalent recursion.
 
--- yield_fn, when given (restores in a terrain job), is called every 256 nodes:
+-- yield_fn, when given (restores in a terrain job), is checked every 32 nodes:
 -- a large lake's subtree has thousands of them.
-local YIELD_NODES = 256
+local YIELD_NODES = 32 -- some nodes cost a level search each: check often
 
 -- Split a subtree's tracer among its nodes in proportion to their water.
 local function distribute_mass(model, n, mass, yield_fn)
@@ -309,8 +322,9 @@ end
 -- Drop a connected water surface by depth mm, splitting at saddles as needed.
 -- Each node lowers its own surface on entry; whatever depth remains passes to
 -- its children; totals are refreshed on exit.
-local function lower(model, n, depth)
+local function lower(model, n, depth, yield_fn)
     local nodes = model.nodes
+    local visited = 0
     local function enter(node, d)
         local initial = node.total
         if node.water > 0 then
@@ -324,6 +338,10 @@ local function lower(model, n, depth)
     local stack = { enter(n, depth) }
     local initial = stack[1][4]
     while #stack > 0 do
+        if yield_fn then
+            visited = visited + 1
+            if visited % YIELD_NODES == 0 then yield_fn() end
+        end
         local frame = stack[#stack]
         local node, d, k = frame[1], frame[2], frame[3]
         if d > 0 and k <= #node.children then
@@ -338,11 +356,11 @@ local function lower(model, n, depth)
 end
 
 -- A wet node or a leaf: lower it and remove infiltrated tracer.
-local function drain_surface(model, n, depth, infiltration_share)
+local function drain_surface(model, n, depth, infiltration_share, yield_fn)
     local volume, mass = n.total, n.total_mass
-    local lost = lower(model, n, depth)
+    local lost = lower(model, n, depth, yield_fn)
     local removed_mass = volume > 0 and mass * div(lost, volume) * infiltration_share or 0
-    distribute_mass(model, n, max(0, mass - removed_mass))
+    distribute_mass(model, n, max(0, mass - removed_mass), yield_fn)
     if lost > 0 and infiltration_share > 0 then
         -- Where water entered the ground this step; tracer is the toxic share.
         model.seepage[#model.seepage + 1] = { seed = n.seed,
@@ -354,11 +372,16 @@ end
 -- Dry interior nodes pass the drain to their children, summing losses in order.
 -- A subtree with no water and no tracer has nothing to drain (Balance has just
 -- refreshed totals), so it is skipped.
-local function drain(model, n, depth, infiltration_share)
-    if n.water > 0 or #n.children == 0 then return drain_surface(model, n, depth, infiltration_share) end
+local function drain(model, n, depth, infiltration_share, yield_fn)
+    if n.water > 0 or #n.children == 0 then return drain_surface(model, n, depth, infiltration_share, yield_fn) end
     local nodes = model.nodes
     local stack = { { n, 1, 0 } }
+    local visited = 0
     while true do
+        if yield_fn then
+            visited = visited + 1
+            if visited % YIELD_NODES == 0 then yield_fn() end
+        end
         local frame = stack[#stack]
         local node, k = frame[1], frame[2]
         local children = node.children
@@ -368,7 +391,7 @@ local function drain(model, n, depth, infiltration_share)
             k = k + 1
             if c.total > 0 or c.total_mass > 0 then
                 if c.water > 0 or #c.children == 0 then
-                    frame[3] = frame[3] + drain_surface(model, c, depth, infiltration_share)
+                    frame[3] = frame[3] + drain_surface(model, c, depth, infiltration_share, yield_fn)
                 else
                     frame[2] = k
                     stack[#stack + 1] = { c, 1, 0 }
@@ -387,7 +410,8 @@ local function drain(model, n, depth, infiltration_share)
     end
 end
 
-function H.Step(model, hours, rain_mm_h, toxic, evaporation, infiltration, runoff)
+-- yield_fn (optional): the simulation runs a step as a background job.
+function H.Step(model, hours, rain_mm_h, toxic, evaporation, infiltration, runoff, yield_fn)
     assert(hours >= 0 and rain_mm_h >= 0 and evaporation >= 0 and infiltration >= 0, "negative water rate")
     assert(runoff >= 0 and runoff <= 1, "invalid runoff coefficient")
     -- Rain falling on standing water is captured fully. Dry land sheds only the
@@ -395,29 +419,61 @@ function H.Step(model, hours, rain_mm_h, toxic, evaporation, infiltration, runof
     local per_cell = hours * rain_mm_h * model.area
     local input, ground, outlet = 0, 0, 0
     if per_cell > 0 then
-        local wet = H.WetCells(model)
-        for i, sink in ipairs(model.sinks) do
-            local amount = per_cell * (wet[i] and 1 or runoff)
-            input = input + per_cell; ground = ground + per_cell - amount
-            if sink == 0 then outlet = outlet + amount
-            else
-                local n = model.nodes[sink]
+        -- Per node, not per cell: a node's rain is per_cell times its wet cells
+        -- plus runoff times its dry ones. Wet cells are those below the level of
+        -- the lake covering the node (as in WetCells), counted by binary search in
+        -- the node's sorted cell elevations; nodes outside every lake are dry.
+        local nodes, cell_z = model.nodes, model.cell_z
+        local wet_count = {}
+        local visited = 0
+        for _, pool in ipairs(H.Pools(model, yield_fn)) do
+            local level = pool.level
+            local stack = { pool.node }
+            while #stack > 0 do
+                if yield_fn then
+                    visited = visited + 1
+                    if visited % YIELD_NODES == 0 then yield_fn() end
+                end
+                local n = nodes[remove(stack)]
+                local zs = cell_z[n.id]
+                if zs then
+                    local lo, hi = 0, #zs
+                    while lo < hi do
+                        local mid = (lo + hi + 1) // 2
+                        if zs[mid] < level then lo = mid else hi = mid - 1 end
+                    end
+                    wet_count[n.id] = lo
+                end
+                for _, id in ipairs(n.children) do stack[#stack + 1] = id end
+            end
+        end
+        for id, n in ipairs(nodes) do
+            if yield_fn and id % 1024 == 0 then yield_fn() end
+            local cells = n.catchment
+            if cells > 0 then
+                local wet = wet_count[id] or 0
+                local amount = per_cell * (wet + runoff * (cells - wet))
+                input = input + per_cell * cells; ground = ground + per_cell * cells - amount
                 n.water = n.water + amount
                 if toxic == true then n.mass = n.mass + amount end
             end
         end
+        -- Cells draining off the map edge are never under a lake.
+        local edge = model.outlet_cells
+        outlet = per_cell * runoff * edge
+        input = input + per_cell * edge; ground = ground + per_cell * edge - outlet
     end
     model.budget.rain = model.budget.rain + input
     model.budget.ground = model.budget.ground + ground
     model.budget.outflow = model.budget.outflow + outlet
-    H.Balance(model)
+    H.Balance(model, yield_fn)
     model.seepage = {}
     local rate, lost = evaporation + infiltration, 0
     if rate > 0 then
         for _, id in ipairs(model.roots) do
             local root = model.nodes[id]
             if root.total > 0 or root.total_mass > 0 then
-                lost = lost + drain(model, root, hours * rate, div(infiltration, rate))
+                lost = lost + drain(model, root, hours * rate, div(infiltration, rate), yield_fn)
             end
         end
         model.budget.infiltration = model.budget.infiltration + lost * div(infiltration, rate)
@@ -461,7 +517,7 @@ end
 -- Ancestors of a node outside every pool subtree cannot be pool members, so only
 -- the cells under wet subtrees are visited (not the whole grid).
 local no_cells = {}
--- yield_fn, when given (the handover of a terrain job), is called every 256 nodes.
+-- yield_fn, when given (the handover of a terrain job), is checked every 32 nodes.
 function H.WetCells(model, yield_fn)
     local wet, concentration, pool_cells = {}, {}, {}
     local pools = H.Pools(model, yield_fn)

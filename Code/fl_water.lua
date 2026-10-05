@@ -4,7 +4,15 @@
 local F = Flood
 local W = {}
 F.Water = W
-DefineClass.FloodWaterMarker = { __parents = { "TerrainWaterObject" } }
+-- Flood's own marker class. Vanilla RecreateWaterObjs (run by every fill) ends
+-- with WaterPropChanged, which copies 15 properties to every plane of the lake at
+-- once (Water.lua:426-433): most of a large lake's redraw. For Flood's markers
+-- the copy goes through the restyle queue instead (W.RestyleStep), a few
+-- milliseconds at a time; other water objects are untouched.
+DefineClass.FloodWaterMarker = {
+    __parents = { "TerrainWaterObject" },
+    WaterPropChanged = function(self) Flood.Water.QueuePlanes(self) end,
+}
 
 local function dirty_union(a, b)
     if not a then return b end
@@ -111,6 +119,8 @@ function W.RestyleStep(budget_ms)
 end
 
 function W.RestylePending() return #restyle_queue > 0 end
+
+W.QueuePlanes = queue_planes
 
 -- Per-cell depth (mm) and toxic concentration for gameplay effects and drawing.
 -- Walking every wet cell at once stalls the game on a flooded map (about 130 ms
@@ -282,7 +292,7 @@ end
 -- Redraws pools within a time budget, largest changes first; the rest follow on
 -- later redraws. Markers follow their water when basins merge or split instead of
 -- being deleted and recreated, because both cost a native fill.
-function W.Refresh()
+function W.Refresh(budget_ms)
     local s, cfg = F.State, F.Config
     if s.saving or not s.model then return end
     local started = GetPreciseTicks()
@@ -346,6 +356,11 @@ function W.Refresh()
         local change = (not entry or entry.z == false or entry.x ~= x) and math.huge or math.abs(z - entry.z)
         local needed = entry and is_large(entry.obj) and large_step
             or (entry and entry.z and z < entry.z and lower_step) or step
+        -- A lake whose last fill was slow (the native fill is one engine call)
+        -- waits for a proportionally larger level change: rare long fills
+        -- instead of frequent ones.
+        local fill_ms = entry and entry.fill_ms or 0
+        if fill_ms > cfg.SLOW_FILL_MS then needed = math.max(needed, large_step * fill_ms / cfg.SLOW_FILL_MS) end
         if change >= needed then work[#work + 1] = { id = id, pool = pool, x = x, y = y, z = z, change = change } end
         if entry then
             entry.expected_m2 = (s.pool_cells and s.pool_cells[id] or 0) * s.model.area
@@ -356,7 +371,7 @@ function W.Refresh()
     end
     table.sort(work, function(a, b) return a.change > b.change end)
     -- The budget covers native water work only, and every redraw makes progress.
-    local budget, native_start = cfg.RENDER_BUDGET_MS, GetPreciseTicks()
+    local budget, native_start = math.min(budget_ms or cfg.RENDER_BUDGET_MS, cfg.RENDER_BUDGET_MS), GetPreciseTicks()
     local function within_budget(n) return n == 0 or GetPreciseTicks() - native_start < budget end
     local retired = 0
     local worst_ms, worst_kind = 0, "none"
@@ -384,6 +399,7 @@ function W.Refresh()
         entry.expected_m2 = (s.pool_cells and s.pool_cells[item.id] or 0) * s.model.area
         local t0 = GetPreciseTicks()
         measure(place(entry, item.x, item.y, item.z), t0)
+        entry.fill_ms = GetPreciseTicks() - t0
         entry.concentration = item.pool.concentration
         local tint = entry.frozen and -1 or tint_of(item.pool.concentration)
         if entry.tint ~= tint then style(entry.obj, tint / 100.0, entry.frozen); entry.tint = tint end

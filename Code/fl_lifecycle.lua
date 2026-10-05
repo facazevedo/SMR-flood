@@ -5,7 +5,8 @@ F.Lifecycle = L
 -- Gameplay effect modules: each owns one domain, checks its own ENABLE_* switch
 -- and reports engine API availability once per enable. Optional hooks:
 -- Tick() every simulation tick, Hourly(hours, nominal_rain_mm_h, toxic),
--- PreSave() to drop transient modifiers before serialization, Restore().
+-- PreSave() to lift anything saved state must not hold (modifiers, Flood
+-- suspensions) and PostSave() to put it back, Restore().
 local EFFECTS = {
     { key = "climate", module = "Climate" },
     { key = "buildings", module = "Buildings" },
@@ -27,16 +28,16 @@ local BOOLEAN_KEYS = { "ENABLE_MOD", "ENABLE_TEST_UI", "DEBUG_LOGS", "DEBUG_HYDR
     "ENABLE_SHUTTLE_EFFECTS", "ENABLE_TRAIN_EFFECTS", "ENABLE_COLONIST_EFFECTS", "ENABLE_ICE",
     "ICE_PLANET_COLD" }
 
-local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "REBUILD_SLICE_MS", "REBUILD_SLICE_SLEEP_MS", "PAUSED_TICK_MS", "TICK_MS",
-    "BACKGROUND_SLICE_MS", "TERRAIN_CHECK_ROWS_PER_TICK", "TERRAIN_BOX_CELLS_PER_TICK", "TERRAIN_SETTLE_MS", "TERRAIN_YIELD_MS",
-    "TEST_RAIN_MULTIPLIER", "SNAPSHOT_BUDGET_MS", "RESTYLE_BUDGET_MS", "EFFECT_INTERVAL_HOURS",
+local POSITIVE_KEYS = { "CELL_SIZE_M", "MAX_GRID_CELLS", "SAMPLE_YIELD_ROWS", "REBUILD_SLICE_MS", "TICK_MS",
+    "BACKGROUND_SLICE_MS", "TERRAIN_CHECK_MS", "TERRAIN_SETTLE_MS", "TERRAIN_YIELD_MS",
+    "TEST_RAIN_MULTIPLIER", "WATER_STEP_BUDGET_MS", "EFFECT_STEP_BUDGET_MS", "BACKGROUND_WAKE_MS", "BACKGROUND_BUDGET_MS", "SNAPSHOT_BUDGET_MS", "RESTYLE_BUDGET_MS", "PROFILE_WINDOW_MS", "EFFECT_INTERVAL_HOURS",
     "EVAPORATION_BARREN_MULTIPLIER", "FLOOD_SUSPEND_DEPTH_MM", "FLOOD_RESUME_DEPTH_MM",
     "RECHARGE_RADIUS_M", "RECHARGE_LITRES_PER_UNIT", "RESIDUE_FULL_EFFECT_MM", "RESIDUE_MAX_RADIUS_M",
     "RAIN_REFERENCE_MM_H", "ROVER_SLOW_DEPTH_MM", "ROVER_FORD_DEPTH_MM", "DRONE_SHORT_DEPTH_MM",
     "SHUTTLE_GROUND_RAIN_MM_H", "TRAIN_WET_DEPTH_MM", "TRAIN_DEEP_DEPTH_MM", "TRAIN_WET_SPEED_PERCENT",
     "TRAIN_DEEP_SPEED_PERCENT", "WADING_DEPTH_MM", "DROWNING_DEPTH_MM",
     "MARKER_AREA_SLACK", "MIN_MARKER_AREA_M2", "SUBSAMPLE_M", "MAX_SUBSAMPLES", "RENDER_BUDGET_MS", "MAX_RENDERED_POOLS",
-    "LARGE_LAKE_PLANES", "LARGE_LAKE_STEP_MM", "RENDER_LOWER_STEP_MM", "ICE_FREEZE_HEAT",
+    "LARGE_LAKE_PLANES", "LARGE_LAKE_STEP_MM", "SLOW_FILL_MS", "RENDER_LOWER_STEP_MM", "ICE_FREEZE_HEAT",
     "ICE_TILE_M", "MAX_ICE_PLATES", "ICE_BUDGET_MS", "ICE_BATCH_PLATES", "ICE_DEPTH_BIN_MM", "ICE_RELEVEL_MM" }
 
 function L.Validate()
@@ -86,9 +87,10 @@ function L.DetectFeatures()
 end
 
 local function each_effect(hook, ...)
+    local measure = F.Diagnostics.Measure
     for _, effect in ipairs(EFFECTS) do
         local fn = F[effect.module][hook]
-        if fn then fn(...) end
+        if fn then measure(effect.key .. " " .. hook, fn, ...) end
     end
 end
 
@@ -109,9 +111,58 @@ local function restore_effects(reason)
     return #failures == 0, table.concat(failures, "; ")
 end
 
-function L.Advance()
+-- The water step (rain, balance, evaporation, seepage over every basin) costs
+-- hundreds of milliseconds on a flooded map, so it runs as a coroutine job in
+-- WATER_STEP_BUDGET_MS slices: started on full ticks, continued on the 100 ms
+-- wakes. While it runs, the snapshot and terrain handover wait (they read the
+-- model); effects use the last complete depths. Saves, disabling and rain
+-- changes finish it at once (L.Advance(true)).
+local water_co, water_started, water_budget = false, 0, 0
+
+local function water_yield()
+    if water_co and coroutine.running() == water_co and GetPreciseTicks() - water_started >= water_budget then
+        coroutine.yield()
+    end
+end
+
+-- Resumes the running water step for one slice of budget_ms (or to the end when
+-- sync). Returns true when no step is running any more.
+local function continue_step(sync, budget_ms)
+    local s = F.State
+    local job = s.water_job
+    if not job then return true end
+    water_budget = math.min(budget_ms or F.Config.WATER_STEP_BUDGET_MS, F.Config.WATER_STEP_BUDGET_MS)
+    repeat
+        water_co, water_started = job.co, GetPreciseTicks()
+        local ok, err = coroutine.resume(job.co)
+        water_co = false
+        if not ok then
+            s.water_job = false
+            error("water step failed: " .. tostring(err), 0)
+        end
+        if coroutine.status(job.co) == "dead" then
+            s.water_job = false
+            s.snapshot_due = true -- the next step waits for a snapshot pass and redraw
+            return true
+        end
+    until not sync
+    return false
+end
+
+function L.WaterStepRunning()
+    return F.State.water_job ~= false and F.State.water_job ~= nil
+end
+
+-- Advances the water to the current game time: finishes a running step if sync
+-- (otherwise lets it continue), then starts a step covering the time since the
+-- last one, running its first slice (or all of it when sync).
+function L.Advance(sync)
     local s = F.State
     if not s.enabled or s.saving or not s.model or s.building then return end
+    if s.water_job and not continue_step(sync) then return end
+    -- Steps and snapshot passes alternate, so the drawn water keeps up on a busy
+    -- map (each step then covers all the time since the last one).
+    if s.snapshot_due and not sync then return end
     local now = GameTime()
     local elapsed = math.max(0, now - (s.last_tick or now))
     if elapsed > 0 then
@@ -122,50 +173,111 @@ function L.Advance()
             s.evaporation_mm_h = s.evaporation_mm_h * F.Config.ICE_SUBLIMATION_FACTOR
             infiltration = 0
         end
-        F.Hydrology.Step(s.model, elapsed * 1.0 / const.HourDuration,
-            s.last_rate or 0, s.last_toxic == true, s.evaporation_mm_h,
-            infiltration, F.Config.RUNOFF_COEFFICIENT)
-        F.Groundwater.Collect(s.model.seepage)
+        local model, hours, rate, toxic, evaporation = s.model, elapsed * 1.0 / const.HourDuration,
+            s.last_rate or 0, s.last_toxic == true, s.evaporation_mm_h
+        s.water_job = { co = coroutine.create(function()
+            F.Hydrology.Step(model, hours, rate, toxic, evaporation, infiltration, F.Config.RUNOFF_COEFFICIENT, water_yield)
+            F.Groundwater.Collect(model.seepage)
+        end) }
+        s.last_tick = now
+        s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
+        if sync then continue_step(true) end -- otherwise the pacer runs it in slices
+        return
     end
     s.last_tick = now
     s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
 end
 
--- Draw the water and ice in short steps. start begins a snapshot pass (every
--- full tick: the water moved); otherwise only a pass under way continues. A
--- completed pass redraws the lakes; redraw and ice work left over continue on
--- later wakes. Before the first completed pass the steps are longer, so water
--- appears quickly after a load.
--- check_ice re-checks every lake's frozen state (full and paused ticks): the
--- conditions can change without the water moving (cold waves, the Terraformed
--- button while paused).
-local function draw(start, check_ice)
+-- Starts the first build when there is no model, then runs one slice of the
+-- terrain job if one is running (never while a water step is mid-way: the
+-- handover captures the model the step is changing).
+local function rebuild_slice(budget_ms)
     local s = F.State
-    local cfg = F.Config
-    if start or not s.wet or F.Water.SnapshotPending() then
-        local budget = (s.pools and s.wet) and cfg.SNAPSHOT_BUDGET_MS or cfg.REBUILD_SLICE_MS
-        if F.Water.SnapshotStep(budget) then
-            F.Water.Refresh()
-            F.Ice.Refresh()
-            return
-        end
+    if s.water_job then return false end
+    if not s.rebuild_job and not s.model then F.Terrain.StartRebuild(s.map) end
+    if not s.rebuild_job then return false end
+    if F.Terrain.StepRebuild(budget_ms) and not s.last_tick then
+        s.last_tick = GameTime()
+        s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
     end
-    if (s.render_backlog or 0) > 0 then F.Water.Refresh() end
-    if check_ice or (s.ice_backlog or 0) > 0 then F.Ice.Refresh() end
-    if F.Water.RestylePending() then F.Water.RestyleStep(cfg.RESTYLE_BUDGET_MS) end
+    return true
 end
 
--- Work that continues between full ticks (every REBUILD_SLICE_SLEEP_MS).
-local function pending_work()
-    local s = F.State
-    return s.rebuild_job or F.Water.SnapshotPending() or (s.render_backlog or 0) > 0 or (s.ice_backlog or 0) > 0
-        or F.Water.RestylePending()
+-- THE PACER. All of Flood's background work runs here, from a real-time thread
+-- every BACKGROUND_WAKE_MS, whatever the game speed. Each wake shares one
+-- BACKGROUND_BUDGET_MS of real time among the pending jobs, so Flood's
+-- background share of the CPU is at most BACKGROUND_BUDGET_MS /
+-- BACKGROUND_WAKE_MS and no single moment exceeds the budget plus one engine
+-- call. The job with first claim on the budget rotates every wake, so a long job
+-- (a background terrain rebuild, a big water step) never starves the others.
+-- The snapshot and the terrain job run only between water steps: they read the
+-- model a step changes. Before the first model exists (after a load) the build
+-- gets REBUILD_SLICE_MS slices, so water appears quickly.
+local PACER_JOBS = {
+    function(s, budget) -- terrain rebuild (background: the model is in use)
+        if not s.rebuild_job or s.water_job then return end
+        F.Diagnostics.Measure("terrain rebuild", rebuild_slice, budget)
+    end,
+    function(s, budget) -- water step
+        if not s.water_job then return end
+        F.Diagnostics.Measure("water step", continue_step, false, budget)
+    end,
+    function(s, budget) -- depth snapshot
+        if s.water_job or not (s.snapshot_due or not s.wet or F.Water.SnapshotPending()) then return end
+        -- The first pass after a load gets a build slice; later ones their own cap.
+        budget = (s.pools and s.wet) and math.min(budget, F.Config.SNAPSHOT_BUDGET_MS) or F.Config.REBUILD_SLICE_MS
+        if F.Diagnostics.Measure("water snapshot", F.Water.SnapshotStep, budget) then
+            s.snapshot_due, s.redraw_due, s.ice_due = false, true, true
+            if s.recheck_flooding then
+                -- After a load: saves hold no Flood suspensions (fl_buildings.lua).
+                s.recheck_flooding = false
+                F.Diagnostics.Measure("buildings recheck", F.Buildings.UpdateFlooding, 0)
+            end
+        end
+    end,
+    function(s, budget) -- lake redraw
+        if not (s.redraw_due or (s.render_backlog or 0) > 0) then return end
+        s.redraw_due = false
+        F.Diagnostics.Measure("water redraw", F.Water.Refresh, budget)
+    end,
+    function(s, budget) -- ice
+        if not (s.ice_due or (s.ice_backlog or 0) > 0) then return end
+        s.ice_due = false
+        F.Diagnostics.Measure("ice", F.Ice.Refresh, budget)
+    end,
+    function(s, budget) -- plane colours
+        if F.Water.RestylePending() then
+            F.Diagnostics.Measure("water colours", F.Water.RestyleStep, math.min(budget, F.Config.RESTYLE_BUDGET_MS))
+        end
+    end,
+    function(s, budget) -- soil
+        if F.Soil.Pending() then F.Diagnostics.Measure("soil", F.Soil.Step, math.min(budget, F.Config.EFFECT_STEP_BUDGET_MS)) end
+    end,
+}
+
+local function background()
+    local s, cfg = F.State, F.Config
+    if not s.model then
+        F.Diagnostics.Measure("terrain rebuild", rebuild_slice, cfg.REBUILD_SLICE_MS)
+        return
+    end
+    local deadline = GetPreciseTicks() + cfg.BACKGROUND_BUDGET_MS
+    local function left() return deadline - GetPreciseTicks() end
+    local n = #PACER_JOBS
+    s.pacer_turn = (s.pacer_turn or 0) % n + 1
+    for i = 0, n - 1 do
+        -- The first job always runs (at least one slice per wake); the rest share what is left.
+        local budget = left()
+        if not s.model or (i > 0 and budget <= 0) then return end
+        PACER_JOBS[(s.pacer_turn + i - 1) % n + 1](s, math.max(1, budget))
+    end
 end
 
 local function update_effects()
     local s = F.State
     s.ticks = s.ticks + 1
-    draw(true, true)
+    -- Cold waves and other conditions change without the water moving.
+    s.ice_due = true
     each_effect("Tick")
     local now = GameTime()
     if not s.last_effects then s.last_effects = now; return end
@@ -173,41 +285,21 @@ local function update_effects()
     if elapsed < F.Config.EFFECT_INTERVAL_HOURS * const.HourDuration then return end
     s.last_effects = now
     each_effect("Hourly", elapsed * 1.0 / const.HourDuration, s.last_nominal_rate or 0, s.last_toxic == true)
+    F.Diagnostics.Report()
 end
 
--- Starts the first build when there is no model, then runs one slice of the
--- terrain job if one is running. Returns true when a job slice ran.
-local function rebuild_slice()
-    local s = F.State
-    if not s.rebuild_job and not s.model then F.Terrain.StartRebuild(s.map) end
-    if not s.rebuild_job then return false end
-    if F.Terrain.StepRebuild() and not s.last_tick then
-        s.last_tick = GameTime()
-        s.last_rate, s.last_toxic, s.last_nominal_rate = F.Rain.Read()
-    end
-    return true
-end
-
--- The simulation thread wakes every TICK_MS, or every REBUILD_SLICE_SLEEP_MS
--- while a terrain job runs. Each wake runs one job slice; the full tick (rain,
--- water step, terrain tracking, effects, drawing) runs once per TICK_MS. A
--- background rebuild therefore never pauses the simulation.
+-- The full tick, every TICK_MS of game time: rain, a new water step (run by the
+-- pacer), terrain tracking, effects. Short: the heavy work is the pacer's.
 function L.Tick()
     local s = F.State
     if F.Config.ENABLE_MOD ~= true then L.Disable(); return end
     if s.saving then return end
-    local sliced = rebuild_slice()
-    if not s.model then F.UI.Refresh(); return end -- first build still running
-    local now = GameTime()
-    if s.last_full_tick and now - s.last_full_tick < F.Config.TICK_MS then
-        -- Between full ticks: snapshot, redraw and ice work left by the last one.
-        draw(false)
-        return
-    end
-    s.last_full_tick = now
+    if not s.model then F.UI.Refresh(); return end -- first build still running (pacer)
+    s.last_full_tick = GameTime()
     F.Rain.Sync()
-    L.Advance()
-    F.Terrain.Track()
+    F.Diagnostics.Measure("water step start", L.Advance)
+    F.Diagnostics.Measure("terrain check", F.Terrain.Track)
+    F.ColdWave.Keep()
     if F.Terrain.WantsRebuild() then F.Terrain.StartRebuild(s.map) end
     update_effects()
     s.status = s.last_rate > 0 and "Rain feeding catchments" or "Dry weather: evaporation and infiltration"
@@ -219,25 +311,27 @@ function L.Tick()
     end
 end
 
--- While the game is paused, game-time threads stand still. The paused tick keeps
--- the picture current: it finishes a terrain scan (same slices) and draws the
--- water and ice, so water appears after loading a save that opens paused. It
--- never steps the water or runs effects: those follow game time.
-function L.PausedTick()
+-- One pacer wake (real time; also while paused). While paused, game-time
+-- threads stand still, so the wake also tracks terrain edits (construction can
+-- be placed while paused) and starts rebuilds; it never steps the water or runs
+-- effects: those follow game time.
+function L.PacerTick()
     local s = F.State
     if F.Config.ENABLE_MOD ~= true or not s.enabled or s.saving or not s.map then return end
-    -- New maps are generated and switched while paused; scan only a settled map
+    -- New maps are generated and switched while paused; work only on a settled map
     -- (the same readiness test as vanilla AgentPlayTest.lua:181).
     if not GameState.gameplay or IsChangingMap() or rawget(_G, "GeneratingMap") then return end
-    rebuild_slice()
-    if s.model then
-        -- Construction can be placed while paused: keep the terrain current too.
+    if IsPaused() and s.model then
         F.Terrain.Track()
         if F.Terrain.WantsRebuild() then F.Terrain.StartRebuild(s.map) end
-        draw(not s.pools, true) -- start the first pass after a load or rebuild; otherwise continue
+        s.ice_due = true
     end
-    F.UI.Refresh()
+    background()
+    if IsPaused() then F.UI.Refresh() end
 end
+
+-- Kept for callers and tests: a paused-time wake is a pacer wake.
+L.PausedTick = L.PacerTick
 
 -- Runs one tick function; an engine-boundary error stops the simulation,
 -- restores vanilla object state and is shown in the panel and logs.
@@ -265,7 +359,7 @@ function L.Enable()
         F.Terrain.Reset()
         s.model, s.grid, s.last_tick, s.last_full_tick = false, false, nil, nil
         s.wet, s.wet_concentration, s.last_effects, s.recharge = false, false, false, {}
-        s.map, s.dirty = MainMap, true
+        s.map, s.dirty, s.recheck_flooding = MainMap, true, true
     end
     s.enabled, s.error = true, false
     L.DetectFeatures()
@@ -274,18 +368,17 @@ function L.Enable()
         Sleep(1) -- let all PostLoadGame handlers finish before creating transient visuals
         while s.enabled do
             if not guarded(L.Tick) then return end
-            -- A rebuild or ice work in progress continues after a short timed sleep.
-            Sleep(pending_work() and F.Config.REBUILD_SLICE_SLEEP_MS or F.Config.TICK_MS)
+            Sleep(F.Config.TICK_MS)
         end
     end)
-    -- Real-time companion: works only while the game is paused (see PausedTick).
-    -- Real-time threads are not saved with the game.
+    -- The pacer (background work, see background()). Real-time threads are not
+    -- saved with the game.
     local map = s.map
     s.paused_thread = CreateRealTimeThread(function()
-        Sleep(F.Config.PAUSED_TICK_MS)
+        Sleep(F.Config.BACKGROUND_WAKE_MS)
         while s.enabled and s.map == map do
-            if IsPaused() and not guarded(L.PausedTick) then return end
-            Sleep(pending_work() and F.Config.REBUILD_SLICE_SLEEP_MS or F.Config.PAUSED_TICK_MS)
+            if not guarded(L.PacerTick) then return end
+            Sleep(F.Config.BACKGROUND_WAKE_MS)
         end
     end)
     F.Log("Lifecycle", "enabled", { cell_m = F.Config.CELL_SIZE_M, debug = F.Config.DEBUG_LOGS,
@@ -301,11 +394,12 @@ local function stop_thread()
     end
     s.thread, s.paused_thread = false, false
     F.Terrain.CancelRebuild()
+    if s.water_job then continue_step(true) end -- never leave the model half-stepped
 end
 
 function L.Disable()
     local s = F.State
-    L.Advance()
+    L.Advance(true)
     F.Save.Capture()
     s.enabled = false
     F.Rain.StopOwned()
@@ -337,7 +431,7 @@ end
 function L.SaveStart()
     local s = F.State
     if not s.map then return end
-    L.Advance()
+    L.Advance(true)
     F.Save.Capture()
     s.saving = true
     -- Game-time threads are serialized with the map. Stop the ticker so the
@@ -355,6 +449,7 @@ end
 function L.SaveDone()
     local s = F.State
     s.saving = false
+    each_effect("PostSave")
     s.last_tick = GameTime()
     if s.resume_after_save then
         s.resume_after_save = false

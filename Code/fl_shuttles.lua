@@ -65,10 +65,23 @@ function SH.Tick()
     set_grounded(rain >= cfg.SHUTTLE_GROUND_RAIN_MM_H)
 end
 
--- Before a save: drop the label modifier (reapplied next tick). Groundings are
--- building suspensions like flooding and stay, so a loaded storm stays grounded.
+-- Before a save: drop the label modifier and lift storm groundings, so a save
+-- loaded after Flood is removed has no hub grounded for good. Both come back
+-- right after the save (groundings) or on the next tick.
+local regrounded = false
+
 function SH.PreSave()
     set_slowdown(0)
+    regrounded = false
+    for _, hub in ipairs(hubs()) do
+        if IsValid(hub) and hub.suspended == REASON then regrounded = true end
+    end
+    set_grounded(false)
+end
+
+function SH.PostSave()
+    if regrounded then set_grounded(true) end
+    regrounded = false
 end
 
 -- Remove the slowdown and lift storm groundings. Idempotent.

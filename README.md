@@ -53,14 +53,15 @@ Edit `Code/fl_config.lua`, redeploy, then restart the game. `metadata.lua` is th
 | `CELL_SIZE_M` | 4 | Requested terrain sampling spacing |
 | `MAX_GRID_CELLS` | 262144 | Larger maps explicitly use a coarser grid, shown in the panel/log |
 | `SUBSAMPLE_M`, `MAX_SUBSAMPLES` | 4, 4 | Each cell takes the lowest of up to 4 x 4 height reads, so narrow notches in basin rims are not missed |
-| `REBUILD_SLICE_MS`, `BACKGROUND_SLICE_MS`, `REBUILD_SLICE_SLEEP_MS` | 100, 15, 100 | Real time per slice for the first build and for background rebuilds; time between slices |
-| `TERRAIN_CHECK_ROWS_PER_TICK`, `TERRAIN_BOX_CELLS_PER_TICK`, `TERRAIN_SETTLE_MS`, `TERRAIN_YIELD_MS` | 2, 4096, 6000, 4 | Rolling check for silent terrain edits; announced edit cells re-read per tick; quiet real time before a rebuild (also while paused); real time a terrain job runs between yields |
-| `PAUSED_TICK_MS` | 500 | While paused: real time between redraws of the current water and ice |
+| `BACKGROUND_WAKE_MS`, `BACKGROUND_BUDGET_MS` | 50, 8 | The pacer: real time between background work wakes (at any game speed), and the real time all background work shares per wake |
+| `REBUILD_SLICE_MS`, `BACKGROUND_SLICE_MS` | 100, 15 | Real time per slice for the first build (before any water exists) and the cap per slice for background rebuilds |
+| `TERRAIN_CHECK_MS`, `TERRAIN_SETTLE_MS`, `TERRAIN_YIELD_MS` | 3, 6000, 4 | Real time per tick re-reading terrain (announced edits first, then the rolling check for silent ones); quiet real time before a rebuild (also while paused); real time a terrain job runs between yields |
 | `TICK_MS` | 3000 | Game time between simulation steps (1/10 game hour) |
 | `EFFECT_INTERVAL_HOURS` | 1 | Cadence of building, dust, soil, groundwater, breakdown and colonist effects |
-| `SNAPSHOT_BUDGET_MS`, `SNAPSHOT_LEVEL_EPS_MM` | 6, 1 | Real time per step keeping the per-cell depth snapshot current (a new pass each tick); lakes whose level moved less than 1 mm are skipped |
+| `WATER_STEP_BUDGET_MS`, `SNAPSHOT_BUDGET_MS`, `SNAPSHOT_LEVEL_EPS_MM` | 6, 6, 1 | Caps per slice of the water step (rain, balance, drying) and of the step keeping the per-cell depth snapshot current (a new pass each tick); lakes whose level moved less than 1 mm are skipped |
+| `EFFECT_STEP_BUDGET_MS`, `RESTYLE_BUDGET_MS`, `PROFILE_WINDOW_MS` | 4, 4, 10000 | Caps per slice of the hourly soil pass and of copying water colours to lake planes; real time over which the panel shows Flood's slowest step |
 | `MAX_RENDERED_POOLS` | 400 | Largest pools drawn as native water; smaller ones still count in the model and effects |
-| `RENDER_BUDGET_MS` | 20 | Real time per redraw step spent rebuilding native water; the rest follows on the next step (every 100 ms while work remains) |
+| `RENDER_BUDGET_MS` | 20 | Real time per redraw step spent rebuilding native water; the rest follows on later pacer wakes |
 | `MARKER_AREA_SLACK`, `MIN_MARKER_AREA_M2` | 1.25, 600 | Bound on each drawn lake's area before the engine lowers it to stop a spill |
 | `LARGE_LAKE_PLANES`, `LARGE_LAKE_STEP_MM` | 2000, 250 | Lakes with this many native water planes redraw every 250 mm of level change; small pools beside them defer their clean-up to the large lake's redraw |
 | `ICE_TILE_M`, `MAX_ICE_PLATES`, `ICE_BUDGET_MS`, `ICE_BATCH_PLATES`, `ICE_DEPTH_BIN_MM`, `ICE_RELEVEL_MM` | 30, 4000, 8, 1, 50, 250 | Ice plate size and cap; real time per ice refresh (passability rebuilds included); plates per passability rebuild; depth classes for laying ice from the shore inward; level change before a frozen lake's plates move |
@@ -81,7 +82,18 @@ Flood touches vanilla code in these places:
 
 ## Saves and removal
 
-The simulation thread is stopped before every save and restarted afterwards, so saves hold only the numerical water state (schema 1, on the surface map), never the thread or the in-memory model. Water markers and speed modifiers are removed before serialization and reapplied on the next tick. Flood and storm suspensions of buildings and shuttle hubs are kept in the save so they survive a reload. To remove Flood from a colony, call `Flood.Lifecycle.Disable()` in the console and save first. Otherwise buildings that were flooded at save time stay suspended without an explanation text.
+Flood can be added to a colony at any time: a save made without it loads normally, and Flood reads the terrain and starts with dry ground. Removing or switching Flood off never breaks a save, because saves hold nothing that needs Flood to load:
+
+- **No Flood objects:** water markers and ice plates are removed before every save and redrawn after it.
+- **No Flood code in saved threads:** the simulation thread is stopped before every save and restarted afterwards. Test rain and the test cold wave run vanilla functions.
+- **No Flood suspensions or modifiers:** flooded buildings and storm-grounded shuttle hubs are switched back on just before each save and suspended again right after it; after a load, the first completed snapshot re-checks flooding. Speed modifiers are reapplied on the next tick.
+- **Only plain data:** the water state (schema 1) and the test-control flags are numbers and booleans in map variables. Without Flood, vanilla keeps them as unused fields on the map.
+- **Vanilla reasons are guarded:** colonist stat and death reasons Flood added ("Walked in the rain", "Drowned") show as blank without Flood; vanilla checks for missing entries.
+- **Timed test cold waves:** the Cold Wave button starts timed vanilla cold waves and renews them while it is on, so without Flood the current one ends after its normal duration.
+
+Loading a save made with Flood after removing it shows vanilla's usual prompt for any missing mod ("The following mods are missing or outdated: Flood. Some features may not work."); choose **Load anyway**. The puddles, lakes and ice are gone in that game (re-enabling Flood brings the saved water back).
+
+Two things stay by design, because they are real game state: soil, health and deposit changes Flood made, and the Terraformed button's full terraforming (switch it off before removing Flood to restore the starting values).
 
 ## Physical scope
 
@@ -93,22 +105,23 @@ Catchment runoff routes within each simulation tick. Infiltration is a configura
 
 Each drawn pool is one native `TerrainWaterObject` that the engine flood-fills from the pool's lowest point. Native fills dominate the cost, so:
 
+- **One pacer, one budget:** all background work (the water step, the depth snapshot, lake redraws, ice, plane colours, soil and terrain rebuilds) runs from one real-time thread that wakes every 50 ms at any game speed and shares 8 ms of real time per wake among the pending jobs. Flood's background work is therefore at most about 16 % of one core, and no moment exceeds 8 ms plus one engine call. Each job used to keep its own budget and wake on game time; together they reached about 50 ms per 100 ms wake, and at 10x speed the game slowed to a quarter of its pace. The job with first claim on the budget rotates every wake, so a long job (a background rebuild, the water step on a flooded map) never starves the others. The game-time thread only runs the short full tick every 3 s of game time: rain, starting the next water step, the terrain check and effects.
 - **Drawn pools:** only the `MAX_RENDERED_POOLS` largest are drawn.
 - **Snapshot, every tick, in steps:** the per-cell depths used by effects and drawing are kept current lake by lake, in steps of 6 ms, by an incremental tracker: lakes whose level moved less than 1 mm are skipped, a changed lake's cells are rewritten in place, and cells it no longer covers are dropped once its walk completes, so effects never see holes. Walking every wet cell at once used to stall a flooded map for about 130 ms every 9 s; now a pass starts every tick (3 s of game time) and the lakes are redrawn as soon as it completes.
-- **Redraw budget:** each redraw step spends at most `RENDER_BUDGET_MS` on native work, largest level changes first, and continues every 100 ms while lakes wait.
+- **Redraw budget:** each redraw step spends at most `RENDER_BUDGET_MS` on native work, largest level changes first, and continues on later pacer wakes while lakes wait.
 - **Marker reuse:** markers move with their water when basins merge or split.
 - **Rising water:** only fills; it never clears and refills.
 - **Narrow rebuild:** a lowered or dried surface clears only its own box and refills the water objects touching it. It doesn't use `ApplyAllWaterObjects`, whose box grows over every intersecting object; that made one cleared lake refill nearly the whole map, taking 2.4 s.
 - **Large lakes:** a lake of thousands of planes takes about 0.8 s to refill, so it redraws only every 250 mm, and small pools beside it leave their clean-up to its next redraw.
-- **Ice:** each plate changes the passability grids, and each `ResumePassEdits` rebuilds them over the box of the plates edited since the matching `SuspendPassEdits`. One plate on its own costs about 10 ms, and a few hundred across a lake or the map in one go stall the game. Plates need `efApplyToGrids` to be walkable (without it a rover stays on the lakebed), so each plate costs one passability rebuild: about 4 ms on a fresh map, more on a busy one. Batches of 6 still took 24-41 ms on a map with 400 frozen lakes, so ice is laid, moved and melted one plate per rebuild, as many as fit in 8 ms per refresh: the longest pause ice can cause is a single plate's rebuild. A refresh starts new batches only within 8 ms of real time, the passability rebuild included. A lake's surface is scanned for ice cells a little at a time, and while ice work is pending it continues every 100 ms. As on real lakes, ice forms from the shore inward (shallow water holds less heat and loses it to the ground; a deep middle must first cool through its whole column): scanned cells go into 5 cm depth classes and plates are laid from the shallowest class, so no sort is needed (sorting a big lake's thousands of cells at once stalled the game). Plates melt in the order they were laid, so open water appears along the shore and the deep middle thaws last. A lake's surface is scanned cell by cell within the budget, and restyling a frozen or thawed lake sets the lake only: its thousands of planes take the new colours from a queue, 4 ms at a time.
+- **Ice:** each plate changes the passability grids, and each `ResumePassEdits` rebuilds them over the box of the plates edited since the matching `SuspendPassEdits`. One plate on its own costs about 10 ms, and a few hundred across a lake or the map in one go stall the game. Plates need `efApplyToGrids` to be walkable (without it a rover stays on the lakebed), so each plate costs one passability rebuild: about 4 ms on a fresh map, more on a busy one. Batches of 6 still took 24-41 ms on a map with 400 frozen lakes, so ice is laid, moved and melted one plate per rebuild, as many as fit in 8 ms per refresh: the longest pause ice can cause is a single plate's rebuild. A refresh starts new batches only within 8 ms of real time, the passability rebuild included. A lake's surface is scanned for ice cells a little at a time, and while ice work is pending the pacer keeps returning to it. As on real lakes, ice forms from the shore inward (shallow water holds less heat and loses it to the ground; a deep middle must first cool through its whole column): scanned cells go into 5 cm depth classes and plates are laid from the shallowest class, so no sort is needed (sorting a big lake's thousands of cells at once stalled the game). Plates melt in the order they were laid, so open water appears along the shore and the deep middle thaws last. A lake's surface is scanned cell by cell within the budget, and restyling a frozen or thawed lake sets the lake only: its thousands of planes take the new colours from a queue, 4 ms at a time.
 - **Terrain, read once:** the whole map is read once per map (the first build) and kept in memory; nothing re-reads it afterwards. Edits the game announces are re-read only in their area:
   - every construction flatten (buildings, tracks, cables, pipes, passages, demolition), through a pass-through wrapper on the global `FlattenTerrainInBuildShape`, which returns the flattened box that vanilla callers discard;
   - `PrefabPlaced` (meteor craters, landscape lakes, crystals);
   - `LandscapeCompleted`;
   - `ConstructionComplete` (dome height surfaces).
   Excavators, regolith extractors and Mirror Sphere digging announce nothing, so a rolling check re-reads two rows per tick and covers the map in about 190 ticks.
-- **Background rebuilds:** when heights change, the basin model is rebuilt as a coroutine job in 15 ms slices, 100 ms apart, while the simulation and effects keep running on the current model. Only the short handover (carrying the water into the new model) holds the water still. Drawn lakes keep their markers: each is re-keyed to the cell its lake sits on and reattached by the redraw, so nothing is cleared and redrawn. A building burst triggers one rebuild: it starts after 6 s of real time without new edits, also while paused. The heavy loops (the basin sort, which `table.sort` cannot pause; restoring and exporting water) call a yield point every few hundred steps that pauses the job once 4 ms have passed, so no slice stalls the game. A rebuild costs about as many Lua lines as the engine's infinite-loop watchdog allows one thread (about 30M); in-game the watchdog counted straight through `Sleep(0)` yields, which is why the work is sliced between timed sleeps.
-- **Paused:** game-time threads stand still, so a real-time companion thread takes over while the game is paused. It finishes a build in the same slices and draws the water and ice, so the water appears even when a save opens paused. It never steps the water or runs effects; those follow game time.
+- **Background rebuilds:** when heights change, the basin model is rebuilt as a coroutine job in pacer slices (at most 15 ms, within the shared budget), while the simulation and effects keep running on the current model. Only the short handover (carrying the water into the new model) holds the water still. Drawn lakes keep their markers: each is re-keyed to the cell its lake sits on and reattached by the redraw, so nothing is cleared and redrawn. A building burst triggers one rebuild: it starts after 6 s of real time without new edits, also while paused. The heavy loops (the basin sort, which `table.sort` cannot pause; restoring and exporting water) call a yield point every few hundred steps that pauses the job once 4 ms have passed, so no slice stalls the game. A rebuild costs about as many Lua lines as the engine's infinite-loop watchdog allows one thread (about 30M); in-game the watchdog counted straight through `Sleep(0)` yields, which is why the work is sliced between timed sleeps.
+- **Paused:** the pacer is a real-time thread, so it keeps working while the game is paused: it finishes a build, tracks terrain edits, and draws the water and ice, so the water appears even when a save opens paused. It never starts a water step or runs effects; those follow game time.
 - **Volume bound:** each drawn lake may cover at most 1.25 times the area the model says is wet (at least 600 m²). A level that overshoots a rim notch narrower than the sampling is lowered by the engine instead of spreading water the model doesn't hold. Overflow follows the model's real volume into the next basin, or off the map edge as outflow, so the map never ends up under water.
 
 All figures below were measured under the harness's debugger on a 6 km map with 147,456 cells. Retail runs without the debugger hook are faster.
@@ -174,24 +187,35 @@ The source folder is this project root. Lua 5.4 `lua` and `luac` are used for lo
 - `flood_90_terrain_edits`: digs a pit as the Excavator does (no message); the rolling check finds it, the model is rebuilt in the background while the simulation keeps running, the terrain is not re-read, lakes keep their markers, and no slice stalls over 100 ms. Then the vanilla construction flatten announces its box at once.
 - `flood_95_terraformed_button`: presses the panel's Terraformed button: every parameter at 100 %, liquid water, breathable air and no cold waves; the second press restores every parameter and the starting conditions. Then, with the planet's water frozen again, lakes ice over with every ice refresh kept short.
 
-Last full run (2026-10-04, game revision 405907, 6 km random map, started from the main menu): 204 of 205 checks passed. The one failure was "simulation kept running during the rebuild" in `flood_90_terrain_edits`: the game was paused by a vanilla dialog while the rebuild ran (the rebuild itself completed while paused). That check now runs only while the game runs.
+Last runs (2026-10-04, v7 with the pacer, game revision 405907, 6 km random map, started from the main menu). Full suite: 9 of 12 scenarios passed (all checks of flood_00-60, 85 and 90). flood_70 failed one thaw check that compared against the old ice level on a 14 mm deep lake (the check now compares with the lakebed); flood_80 and flood_95 timed out because a vanilla story event popup (three choices, which the harness does not answer) kept the game paused. Rerun on a fresh colony, flood_70, flood_80 and flood_95 passed every check. The pacer made the scenarios faster: flood_10 80 s → 37 s, flood_20 58 s → 27 s. Save compatibility (`scenarios/manual/flood_save_compat.lua`): A 13/13, B 10/10, C 5/5, D 9/9. One earlier D run timed out waiting for the first terrain read on a save whose colony had been started from inside another game; it passed on the rerun.
 
 | Scenario | Checks | Highlights |
 |---|---|---|
-| `flood_00_new_game` | 20/20 | 147,456 cells; first terrain read and model in about 75 slices |
-| `flood_10_rain` | 19/19 | Real storms; depth snapshot steps at most 11 ms, redraw steps at most 49 ms |
+| `flood_00_new_game` | 20/20 | 147,456 cells; first terrain read and model |
+| `flood_10_rain` | 19/19 | Real storms; spill bounds, contamination, redraw catches up |
 | `flood_20_effects` | 32/32 | Every building, vehicle, colonist, dust and shuttle effect; disable/enable |
 | `flood_30_save_load` | 12/12 | Water volume restored after a load |
-| `flood_40_ground_and_people` | 19/19 | Fresh seepage recharges a deposit; soil raised by fresh, lowered by toxic water and residue |
-| `flood_50_build_drones_trains` | 17/17 | Construction flattening noticed and rebuilt in the background; drone battery drain; train 700 → 105 |
+| `flood_40_ground_and_people` | 19/19 | Fresh seepage recharges a deposit; soil raised by fresh, lowered by toxic water and residue (each soil pass finished about 0.6 s after its hour, at 10x) |
+| `flood_50_build_drones_trains` | 17/17 | Construction flattening noticed and rebuilt in the background; drone battery drain; train slowed |
 | `flood_60_train_route` | 12/12 | Real train slower over flooded rail |
-| `flood_70_ice` | 19/19 | Walkable ice at the water level; rover on the ice; thaw restores the lakebed (now checks the largest lake as soon as its ice is complete: 194 s → 22 s) |
-| `flood_80_cold_wave_button` | 15/15 | A vanilla cold wave freezes 400 lakes; ice refreshes at most 18 ms, single plates at most 14 ms; the ice melts after the wave |
+| `flood_70_ice` | 18/18 (rerun) | Walkable ice at the water level; rover on the ice; thaw restores the lakebed |
+| `flood_80_cold_wave_button` | 15/15 (rerun) | A vanilla cold wave freezes the lakes; ice refreshes at most 16 ms; the ice melts after the wave |
 | `flood_85_paused_water` | 10/10 | Read and redrawn while paused; game time unchanged |
-| `flood_90_terrain_edits` | 16/17 | Silent pit found and rebuilt in the background (slices at most 32 ms; 396 of 400 lakes kept their markers) |
-| `flood_95_terraformed_button` | 13/13 | Full terraforming on, starting conditions restored off; then ice forms with refreshes at most 16 ms |
+| `flood_90_terrain_edits` | 16/16 | Silent pit found and rebuilt in the background; slices under 100 ms |
+| `flood_95_terraformed_button` | 13/13 (rerun) | Full terraforming on, starting conditions restored off; then ice forms with refreshes at most 15 ms |
+| `flood_compat_a_save_with_flood` | 13/13 | Saved with lakes, ice, a flooded building and a slowed rover |
+| `flood_compat_b_load_without_flood` | 10/10 | Vanilla's "Flood is missing ... Load anyway" prompt; after loading: no Flood objects, suspensions or modifiers; 6+ game hours run on; re-saved |
+| `flood_compat_c_save_without_flood` | 5/5 | A colony that never had Flood |
+| `flood_compat_d_load_with_flood` | 9/9 | Flood starts on it, dry; poured water drawn |
 
 No rebuild was stopped by the engine watchdog, there was no outside Lua reload during the run, and the log has no Flood errors. The run's Lua errors come from vanilla code triggered by test fixtures (colonists spawned outside, test domes on rough ground, drones moved by hand, instant builds on uneven ground).
+
+`scenarios/manual/flood_save_compat.lua` is not part of the suite: its four scenarios run by name, loaded with `flood_ingame.lua` (`--file` both), with Flood switched off and on between them (`TurnModOff("Flood")` / `TurnModOn("Flood")`, then `smr reload --full`):
+
+- `flood_compat_a_save_with_flood` (Flood on): water, ice, a flooded building and a slowed rover; saves; Flood's state is back right after the save.
+- `flood_compat_b_load_without_flood` (Flood off): loads that save; no objects of Flood's classes, no Flood suspensions or speed modifiers; the game runs on and saves again.
+- `flood_compat_c_save_without_flood` (Flood off): saves a colony that never had Flood.
+- `flood_compat_d_load_with_flood` (Flood on): loads it; Flood starts, reads the terrain, starts dry, and draws poured water.
 
 Run them after `smr daemon start --hidden`. Enable Flood for the session (`TurnModOn("Flood")`, then `smr reload --full`), then run `smr test <scenario> --project <this folder> --screenshot`. Reports and screenshots go to `.harness/`.
 
